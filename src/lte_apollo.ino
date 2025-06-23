@@ -21,6 +21,7 @@ NBClient client;
 GPRS gprs;
 NBFileUtils nbfs;
 RTCZero rtc;
+long timeDiffMs = 0; // difference between FTP time and RTC in ms
 
 File dataFile;
 
@@ -144,9 +145,13 @@ bool syncTime() {
     return false;
   }
   rtc.begin();
+  unsigned long before = rtc.getEpoch();
+  timeDiffMs = ((long)epoch - (long)before) * 1000L;
   rtc.setEpoch(epoch);
   DEBUG_PRINT("Epoch: ");
   DEBUG_PRINTLN(epoch);
+  DEBUG_PRINT("RTC diff ms: ");
+  DEBUG_PRINTLN(timeDiffMs);
   DEBUG_PRINTLN("Time synced via FTP");
   return true;
 }
@@ -173,6 +178,16 @@ void appendData(File &f) {
            year() % 100, month(), day(), hour(), minute(), second(),
            readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
            bme.readHumidity(), readBattery());
+  f.println(buf);
+  DEBUG_PRINTLN(buf);
+}
+
+void appendStatusData(File &f) {
+  char buf[120];
+  snprintf(buf, sizeof(buf), "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%.2f;%ld",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(), readBattery(), timeDiffMs);
   f.println(buf);
   DEBUG_PRINTLN(buf);
 }
@@ -210,7 +225,7 @@ void setup() {
   File stat = SD.open(String(SENSOR_ID) + "_stat0.txt", FILE_WRITE);
   DEBUG_PRINTLN("Writing stat file");
   for (int i = 0; i < 3; ++i) {
-    appendData(stat);
+    appendStatusData(stat);
   }
   stat.close();
   // TODO: FTP upload of stat file
@@ -252,7 +267,10 @@ void loop() {
   if (millis() - lastHour >= 3600000) {
     syncTime();
     DEBUG_PRINTLN("Hourly time sync");
-    // TODO: send status via FTP
+    File stat = SD.open(String(SENSOR_ID) + "_stat1.txt", FILE_WRITE);
+    appendStatusData(stat);
+    stat.close();
+    // TODO: FTP upload of stat file
     lastHour += 3600000;
   }
 
