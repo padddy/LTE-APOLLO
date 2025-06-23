@@ -116,9 +116,8 @@ bool syncTime() {
     DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
-  IPAddress dataIp = ftp.remoteIP();
   NBClient data;
-  if (!data.connect(dataIp, dataPort)) {
+  if (!data.connect(FTP_SERVER, dataPort)) {
     ftp.stop();
     DEBUG_PRINTLN("data connection failed");
     return false;
@@ -224,9 +223,8 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
     DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
-  IPAddress dataIp = ftp.remoteIP();
   NBClient data;
-  if (!data.connect(dataIp, dataPort)) {
+  if (!data.connect(FTP_SERVER, dataPort)) {
     ftp.stop();
     f.close();
     DEBUG_PRINTLN("data connect failed");
