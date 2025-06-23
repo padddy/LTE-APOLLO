@@ -192,6 +192,67 @@ void appendStatusData(File &f) {
   DEBUG_PRINTLN(buf);
 }
 
+bool ftpUpload(const String &localName, const char *remoteDir) {
+  File f = SD.open(localName);
+  if (!f) {
+    DEBUG_PRINTLN("FTP open failed");
+    return false;
+  }
+
+  NBClient ftp;
+  if (!ftp.connect(FTP_SERVER, FTP_PORT)) {
+    DEBUG_PRINTLN("FTP connect failed");
+    f.close();
+    return false;
+  }
+
+  ftp.print("USER " FTP_USER "\r\n");
+  delay(200);
+  ftp.print("PASS " FTP_PASS "\r\n");
+  delay(200);
+  ftp.print("TYPE I\r\n");
+  delay(200);
+  ftp.print("PASV\r\n");
+  delay(500);
+
+  String resp = "";
+  while (ftp.available()) resp += (char)ftp.read();
+  int ip1,ip2,ip3,ip4,p1,p2;
+  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
+             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
+    ftp.stop();
+    f.close();
+    DEBUG_PRINTLN("PASV parse failed");
+    return false;
+  }
+  IPAddress dataIp(ip1,ip2,ip3,ip4);
+  int dataPort = p1*256 + p2;
+  NBClient data;
+  if (!data.connect(dataIp, dataPort)) {
+    ftp.stop();
+    f.close();
+    DEBUG_PRINTLN("data connect failed");
+    return false;
+  }
+
+  ftp.print("STOR ");
+  ftp.print(remoteDir);
+  ftp.print("/");
+  ftp.print(localName);
+  ftp.print("\r\n");
+  delay(200);
+
+  while (f.available()) {
+    data.write(f.read());
+  }
+  data.stop();
+  ftp.print("QUIT\r\n");
+  ftp.stop();
+  f.close();
+  DEBUG_PRINTLN("FTP upload done");
+  return true;
+}
+
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -222,13 +283,14 @@ void setup() {
     blinkError(3);
   }
   DEBUG_PRINTLN("SD card ready");
-  File stat = SD.open(String(SENSOR_ID) + "_stat0.txt", FILE_WRITE);
+  String statName = String(SENSOR_ID) + "_stat0.txt";
+  File stat = SD.open(statName, FILE_WRITE);
   DEBUG_PRINTLN("Writing stat file");
   for (int i = 0; i < 3; ++i) {
     appendStatusData(stat);
   }
   stat.close();
-  // TODO: FTP upload of stat file
+  ftpUpload(statName, FTP_STAT_DIR);
 
   startDay = millis();
   lastMinute = millis();
@@ -267,10 +329,11 @@ void loop() {
   if (millis() - lastHour >= 3600000) {
     syncTime();
     DEBUG_PRINTLN("Hourly time sync");
-    File stat = SD.open(String(SENSOR_ID) + "_stat1.txt", FILE_WRITE);
+    String statName = String(SENSOR_ID) + "_stat1.txt";
+    File stat = SD.open(statName, FILE_WRITE);
     appendStatusData(stat);
     stat.close();
-    // TODO: FTP upload of stat file
+    ftpUpload(statName, FTP_STAT_DIR);
     lastHour += 3600000;
   }
 
