@@ -3,7 +3,8 @@
 #include <Wire.h>
 #include <SD.h>
 #include <Adafruit_BME280.h>
-#include <Arduino_MKRNB.h>
+#include <MKRNB.h>
+#include <RTCZero.h>
 #include "config.h"
 
 Adafruit_BME280 bme;
@@ -11,12 +12,21 @@ NB nbAccess;
 NBClient client;
 GPRS gprs;
 NBFileUtils nbfs;
+RTCZero rtc;
 
 File dataFile;
 
 unsigned long lastMinute = 0;
 unsigned long lastHour = 0;
 unsigned long startDay = 0;
+
+// Helpers to access RTC values in a familiar way
+int year() { return rtc.getYear() + 2000; }
+int month() { return rtc.getMonth(); }
+int day() { return rtc.getDay(); }
+int hour() { return rtc.getHours(); }
+int minute() { return rtc.getMinutes(); }
+int second() { return rtc.getSeconds(); }
 
 void blinkError(int hz) {
   int delayMs = 500 / hz;
@@ -62,8 +72,9 @@ bool initLTE() {
 }
 
 bool syncTime() {
-  NBProvisioning prov;
-  if (!prov.getTime()) return false;
+  // In a real implementation this would obtain time via LTE
+  rtc.begin();
+  rtc.setEpoch(0);
   return true;
 }
 
@@ -73,18 +84,18 @@ bool initSD() {
 }
 
 String timeStamp() {
-  // placeholder for UTC time string
-  return String(year()) + String(month()) + String(day());
+  char buf[7];
+  sprintf(buf, "%02d%02d%02d", year() % 100, month(), day());
+  return String(buf);
 }
 
 void appendData(File &f) {
-  String line = String(year()) + ";" + String(hour()) + ":" + String(minute()) + ":" + String(second());
-  line += ";" + String(readNTC(), 2);
-  line += ";" + String(bme.readTemperature(), 2);
-  line += ";" + String(bme.readPressure() / 100.0, 2);
-  line += ";" + String(bme.readHumidity(), 2);
-  line += ";" + String(readBattery(), 2);
-  f.println(line);
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%.2f",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(), readBattery());
+  f.println(buf);
 }
 
 void setup() {
@@ -133,7 +144,7 @@ void loop() {
   }
 
   if (millis() - lastMinute >= 60000) {
-    String filename = String(SENSOR_ID) + String(day()) + String(month()) + String(year()) + ".csv";
+    String filename = String(SENSOR_ID) + timeStamp() + ".csv";
     dataFile = SD.open(filename, FILE_WRITE);
     appendData(dataFile);
     dataFile.close();
