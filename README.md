@@ -15,7 +15,9 @@ Grundlage gedacht und muss ggf. an die eigenen Anforderungen angepasst werden.
 
 Die Uhrzeit wird regelmäßig über den FTP-Server bezogen. Dazu wird die Datei
 `time.txt` aus dem Verzeichnis `/LTE-APOLLO` heruntergeladen und der enthaltende
-Epoch-Wert zur Aktualisierung der RTC genutzt. Die Abweichung zwischen vorheriger
+Epoch-Wert zur Aktualisierung der RTC genutzt. Die Übertragung erfolgt im
+erweiterten passiven Modus (EPSV), da der klassische PASV-Modus auf manchen
+Servern einen Parsing-Fehler verursachte. Die Abweichung zwischen vorheriger
 RTC-Zeit und FTP-Zeit wird bei jeder Statusmeldung als `T_DIFF` in Millisekunden
 protokolliert.
 

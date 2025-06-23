@@ -104,20 +104,19 @@ bool syncTime() {
   delay(200);
   ftp.print("TYPE I\r\n");
   delay(200);
-  ftp.print("PASV\r\n");
+  ftp.print("EPSV\r\n");
   delay(500);
 
   String resp = "";
   while (ftp.available()) resp += (char)ftp.read();
-  int ip1,ip2,ip3,ip4,p1,p2;
-  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
-             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
+  int dataPort;
+  if (sscanf(resp.c_str(), "229 Entering Extended Passive Mode (|||%d|)",
+             &dataPort) != 1) {
     ftp.stop();
-    DEBUG_PRINTLN("PASV parse failed");
+    DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
-  IPAddress dataIp(ip1,ip2,ip3,ip4);
-  int dataPort = p1*256 + p2;
+  IPAddress dataIp = ftp.remoteIP();
   NBClient data;
   if (!data.connect(dataIp, dataPort)) {
     ftp.stop();
@@ -212,21 +211,20 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
   delay(200);
   ftp.print("TYPE I\r\n");
   delay(200);
-  ftp.print("PASV\r\n");
+  ftp.print("EPSV\r\n");
   delay(500);
 
   String resp = "";
   while (ftp.available()) resp += (char)ftp.read();
-  int ip1,ip2,ip3,ip4,p1,p2;
-  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
-             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
+  int dataPort;
+  if (sscanf(resp.c_str(), "229 Entering Extended Passive Mode (|||%d|)",
+             &dataPort) != 1) {
     ftp.stop();
     f.close();
-    DEBUG_PRINTLN("PASV parse failed");
+    DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
-  IPAddress dataIp(ip1,ip2,ip3,ip4);
-  int dataPort = p1*256 + p2;
+  IPAddress dataIp = ftp.remoteIP();
   NBClient data;
   if (!data.connect(dataIp, dataPort)) {
     ftp.stop();
