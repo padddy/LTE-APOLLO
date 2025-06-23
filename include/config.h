@@ -35,8 +35,9 @@
 #define TIME_SYNC_INTERVAL_MIN 60
 #define DAILY_UPLOAD_TIME "23:55:00"
 
-// FTP path for time synchronization
-#define TIME_FILE_PATH "/LTE-APOLLO/time.txt"
+// NTP server configuration for time synchronization
+#define NTP_SERVER_IP {129, 6, 15, 28} // time.nist.gov
+#define NTP_LOCAL_PORT 2390
 
 #define SOFTWARE_VERSION "1.0"
 

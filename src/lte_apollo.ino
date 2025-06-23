@@ -21,7 +21,12 @@ NBClient client;
 GPRS gprs;
 NBFileUtils nbfs;
 RTCZero rtc;
-long timeDiffMs = 0; // difference between FTP time and RTC in ms
+NBUDP Udp;
+IPAddress ntpServer NTP_SERVER_IP;
+unsigned int localPort = NTP_LOCAL_PORT;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+long timeDiffMs = 0; // difference between NTP time and RTC in ms
 
 File dataFile;
 
@@ -90,68 +95,47 @@ bool initLTE() {
   return true;
 }
 
+unsigned long sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  Udp.beginPacket(address, 123);
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+  return millis();
+}
+
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via FTP...");
-  NBClient ftp;
-  if (!ftp.connect(FTP_SERVER, FTP_PORT)) {
-    DEBUG_PRINTLN("FTP connect failed");
-    return false;
+  DEBUG_PRINTLN("Syncing time via NTP...");
+  Udp.begin(localPort);
+  sendNTPpacket(ntpServer);
+  delay(1000);
+  if (Udp.parsePacket()) {
+    Udp.read(packetBuffer, NTP_PACKET_SIZE);
+    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+    unsigned long secsSince1900 = (highWord << 16) | lowWord;
+    const unsigned long seventyYears = 2208988800UL;
+    unsigned long epoch = secsSince1900 - seventyYears;
+    rtc.begin();
+    unsigned long before = rtc.getEpoch();
+    timeDiffMs = ((long)epoch - (long)before) * 1000L;
+    rtc.setEpoch(epoch);
+    DEBUG_PRINT("Epoch: ");
+    DEBUG_PRINTLN(epoch);
+    DEBUG_PRINT("RTC diff ms: ");
+    DEBUG_PRINTLN(timeDiffMs);
+    DEBUG_PRINTLN("Time synced via NTP");
+    return true;
   }
-
-  ftp.print("USER " FTP_USER "\r\n");
-  delay(200);
-  ftp.print("PASS " FTP_PASS "\r\n");
-  delay(200);
-  ftp.print("TYPE I\r\n");
-  delay(200);
-  ftp.print("EPSV\r\n");
-  delay(500);
-
-  String resp = "";
-  while (ftp.available()) resp += (char)ftp.read();
-  int dataPort;
-  if (sscanf(resp.c_str(), "229 Entering Extended Passive Mode (|||%d|)",
-             &dataPort) != 1) {
-    ftp.stop();
-    DEBUG_PRINTLN("EPSV parse failed");
-    return false;
-  }
-  NBClient data;
-  if (!data.connect(FTP_SERVER, dataPort)) {
-    ftp.stop();
-    DEBUG_PRINTLN("data connection failed");
-    return false;
-  }
-
-  ftp.print("RETR " TIME_FILE_PATH "\r\n");
-  delay(200);
-
-  String tbuf = "";
-  unsigned long start = millis();
-  while (millis() - start < 5000) {
-    while (data.available()) {
-      tbuf += (char)data.read();
-    }
-  }
-  data.stop();
-  ftp.print("QUIT\r\n");
-  ftp.stop();
-
-  unsigned long epoch = tbuf.toInt();
-  if (epoch == 0) {
-    DEBUG_PRINTLN("Invalid epoch");
-    return false;
-  }
-  rtc.begin();
-  unsigned long before = rtc.getEpoch();
-  timeDiffMs = ((long)epoch - (long)before) * 1000L;
-  rtc.setEpoch(epoch);
-  DEBUG_PRINT("Epoch: ");
-  DEBUG_PRINTLN(epoch);
-  DEBUG_PRINT("RTC diff ms: ");
-  DEBUG_PRINTLN(timeDiffMs);
-  DEBUG_PRINTLN("Time synced via FTP");
-  return true;
+  DEBUG_PRINTLN("NTP no response");
+  return false;
 }
 
 bool initSD() {

@@ -13,13 +13,10 @@ Die Werte werden im CSV-Format in Tagesdateien gespeichert. Statusmeldungen und
 Messdaten können an einen FTP-Server gesendet werden. Das Programm ist als
 Grundlage gedacht und muss ggf. an die eigenen Anforderungen angepasst werden.
 
-Die Uhrzeit wird regelmäßig über den FTP-Server bezogen. Dazu wird die Datei
-`time.txt` aus dem Verzeichnis `/LTE-APOLLO` heruntergeladen und der enthaltende
-Epoch-Wert zur Aktualisierung der RTC genutzt. Die Übertragung erfolgt im
-erweiterten passiven Modus (EPSV), da der klassische PASV-Modus auf manchen
-Servern einen Parsing-Fehler verursachte. Die Abweichung zwischen vorheriger
-RTC-Zeit und FTP-Zeit wird bei jeder Statusmeldung als `T_DIFF` in Millisekunden
-protokolliert.
+Die Uhrzeit wird nun per UDP von einem NTP-Server bezogen. Dazu sendet der
+Mikrocontroller ein NTP-Paket und wertet die Antwort aus. Die Differenz zwischen
+der vorherigen RTC-Zeit und der NTP-Zeit wird bei jeder Statusmeldung als
+`T_DIFF` in Millisekunden protokolliert.
 
 ### Debug
 Durch Aktivieren von `DEBUG_SERIAL` in `config.h` werden Statusmeldungen über die
