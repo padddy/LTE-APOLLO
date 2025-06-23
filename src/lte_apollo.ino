@@ -5,7 +5,6 @@
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
 #include <RTCZero.h>
-#include <ArduinoHttpClient.h>
 #include "config.h"
 
 #ifdef DEBUG_SERIAL
@@ -22,7 +21,6 @@ NBClient client;
 GPRS gprs;
 NBFileUtils nbfs;
 RTCZero rtc;
-HttpClient timeClient(client, TIME_API_HOST, TIME_API_PORT);
 
 File dataFile;
 
@@ -92,30 +90,64 @@ bool initLTE() {
 }
 
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via LTE...");
-  timeClient.get(TIME_API_PATH);
-  int status = timeClient.responseStatusCode();
-  if (status != 200) {
-    DEBUG_PRINT("HTTP status: ");
-    DEBUG_PRINTLN(status);
-    timeClient.stop();
+  DEBUG_PRINTLN("Syncing time via FTP...");
+  NBClient ftp;
+  if (!ftp.connect(FTP_SERVER, FTP_PORT)) {
+    DEBUG_PRINTLN("FTP connect failed");
     return false;
   }
-  String body = timeClient.responseBody();
-  timeClient.stop();
-  int idx = body.indexOf("\"unixtime\":");
-  if (idx < 0) {
-    DEBUG_PRINTLN("Time parse error");
+
+  ftp.print("USER " FTP_USER "\r\n");
+  delay(200);
+  ftp.print("PASS " FTP_PASS "\r\n");
+  delay(200);
+  ftp.print("TYPE I\r\n");
+  delay(200);
+  ftp.print("PASV\r\n");
+  delay(500);
+
+  String resp = "";
+  while (ftp.available()) resp += (char)ftp.read();
+  int ip1,ip2,ip3,ip4,p1,p2;
+  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
+             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
+    ftp.stop();
+    DEBUG_PRINTLN("PASV parse failed");
     return false;
   }
-  idx += 11; // length of "unixtime":
-  int endIdx = body.indexOf(',', idx);
-  unsigned long epoch = body.substring(idx, endIdx).toInt();
+  IPAddress dataIp(ip1,ip2,ip3,ip4);
+  int dataPort = p1*256 + p2;
+  NBClient data;
+  if (!data.connect(dataIp, dataPort)) {
+    ftp.stop();
+    DEBUG_PRINTLN("data connection failed");
+    return false;
+  }
+
+  ftp.print("RETR " TIME_FILE_PATH "\r\n");
+  delay(200);
+
+  String tbuf = "";
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    while (data.available()) {
+      tbuf += (char)data.read();
+    }
+  }
+  data.stop();
+  ftp.print("QUIT\r\n");
+  ftp.stop();
+
+  unsigned long epoch = tbuf.toInt();
+  if (epoch == 0) {
+    DEBUG_PRINTLN("Invalid epoch");
+    return false;
+  }
   rtc.begin();
   rtc.setEpoch(epoch);
   DEBUG_PRINT("Epoch: ");
   DEBUG_PRINTLN(epoch);
-  DEBUG_PRINTLN("Time synced");
+  DEBUG_PRINTLN("Time synced via FTP");
   return true;
 }
 
