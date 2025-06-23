@@ -27,10 +27,9 @@
 #define FTP_STAT_DIR "/status"
 #define FTP_DATA_DIR "/data"
 
-// Time API for LTE time synchronization
-#define TIME_API_HOST "timeapi.io"
-#define TIME_API_PORT 80
-#define TIME_API_PATH "/api/Time/current/zone?timeZone=UTC"
+// NTP server for time synchronization via UDP
+#define NTP_SERVER_IP IPAddress(129, 6, 15, 28) // time.nist.gov
+#define NTP_LOCAL_PORT 2390
 
 #define SIM_PIN "1234"
 #define SIM_APN "apn"

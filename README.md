@@ -13,10 +13,10 @@ Die Werte werden im CSV-Format in Tagesdateien gespeichert. Statusmeldungen und
 Messdaten können an einen FTP-Server gesendet werden. Das Programm ist als
 Grundlage gedacht und muss ggf. an die eigenen Anforderungen angepasst werden.
 
-Die Uhrzeit wird jetzt über LTE von "timeapi.io" per HTTP abgefragt. Die Antwort
-liefert einen Unix-Zeitstempel, der in die RTC übernommen wird. Die Differenz
-zwischen der alten RTC-Zeit und der neuen Zeit wird als `T_DIFF` in Millisekunden
-bei jeder Statusmeldung protokolliert.
+Die Uhrzeit wird per LTE über NTP synchronisiert. Dazu wird ein UDP-Paket an
+`time.nist.gov` gesendet und der empfangene Zeitstempel in die RTC
+übernommen. Die Differenz zwischen der alten RTC-Zeit und der neuen Zeit wird
+als `T_DIFF` in Millisekunden bei jeder Statusmeldung protokolliert.
 
 ### Debug
 Durch Aktivieren von `DEBUG_SERIAL` in `config.h` werden Statusmeldungen über die

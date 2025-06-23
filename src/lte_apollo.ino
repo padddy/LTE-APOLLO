@@ -4,7 +4,6 @@
 #include <SD.h>
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
-#include <ArduinoHttpClient.h>
 #include <RTCZero.h>
 #include "config.h"
 
@@ -21,9 +20,10 @@ NB nbAccess;
 NBClient client;
 GPRS gprs;
 RTCZero rtc;
-NBClient httpClient;
-HttpClient http(httpClient, TIME_API_HOST, TIME_API_PORT);
-long timeDiffMs = 0; // difference between HTTP time and RTC in ms
+NBUDP udp;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+long timeDiffMs = 0; // difference between NTP time and RTC in ms
 
 File dataFile;
 
@@ -94,22 +94,37 @@ bool initLTE() {
   return true;
 }
 
+unsigned long sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;            // Stratum
+  packetBuffer[2] = 6;            // Polling Interval
+  packetBuffer[3] = 0xEC;         // Precision
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+  udp.beginPacket(address, 123);
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+  return millis();
+}
+
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via HTTP...");
-  http.get(TIME_API_PATH);
-  int status = http.responseStatusCode();
-  if (status != 200) {
-    DEBUG_PRINT("HTTP error: ");
-    DEBUG_PRINTLN(status);
+  DEBUG_PRINTLN("Syncing time via NTP...");
+  udp.begin(NTP_LOCAL_PORT);
+  sendNTPpacket(NTP_SERVER_IP);
+  delay(1000);
+  if (!udp.parsePacket()) {
+    DEBUG_PRINTLN("No NTP response");
     return false;
   }
-  String body = http.responseBody();
-  int idx = body.indexOf("\"epochSeconds\":");
-  if (idx < 0) idx = body.indexOf("\"unixtime\":");
-  if (idx < 0) return false;
-  idx = body.indexOf(':', idx);
-  int end = body.indexOf(',', idx);
-  unsigned long epoch = body.substring(idx + 1, end).toInt();
+  udp.read(packetBuffer, NTP_PACKET_SIZE);
+  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);
+  unsigned long secsSince1900 = (highWord << 16) | lowWord;
+  const unsigned long seventyYears = 2208988800UL;
+  unsigned long epoch = secsSince1900 - seventyYears;
   rtc.begin();
   unsigned long before = rtc.getEpoch();
   timeDiffMs = ((long)epoch - (long)before) * 1000L;
@@ -118,7 +133,7 @@ bool syncTime() {
   DEBUG_PRINTLN(epoch);
   DEBUG_PRINT("RTC diff ms: ");
   DEBUG_PRINTLN(timeDiffMs);
-  DEBUG_PRINTLN("Time synced via HTTP");
+  DEBUG_PRINTLN("Time synced via NTP");
   return true;
 }
 
@@ -178,20 +193,23 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
   delay(200);
   ftp.print("TYPE I\r\n");
   delay(200);
-  ftp.print("PASV\r\n");
+  ftp.print("EPSV\r\n");
   delay(500);
 
   String resp = "";
   while (ftp.available()) resp += (char)ftp.read();
-  int ip1,ip2,ip3,ip4,p1,p2;
-  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
-             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
+  int start = resp.indexOf("(|||") + 4;
+  int end = resp.indexOf("|)", start);
+  int dataPort = 0;
+  if (start >= 4 && end > start) {
+    dataPort = resp.substring(start, end).toInt();
+  }
+  if (dataPort == 0) {
     ftp.stop();
     f.close();
-    DEBUG_PRINTLN("PASV parse failed");
+    DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
-  int dataPort = p1*256 + p2;
   NBClient data;
   if (!data.connect(FTP_SERVER, dataPort)) {
     ftp.stop();
