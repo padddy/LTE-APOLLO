@@ -258,8 +258,10 @@ void setup() {
   if (!syncTime()) {
     blinkError(4);
     digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
+    DEBUG_PRINTLN("Time sync failed");
+  } else {
+    DEBUG_PRINTLN("Time synchronized");
   }
-  DEBUG_PRINTLN("Time synchronized");
   if (!checkBME()) {
     blinkError(3);
     digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
