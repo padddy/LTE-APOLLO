@@ -94,7 +94,7 @@ bool initLTE() {
   return true;
 }
 
-unsigned long sendNTPpacket(IPAddress &address) {
+unsigned long sendNTPpacket(const IPAddress &address) {
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   packetBuffer[0] = 0b11100011;   // LI, Version, Mode
   packetBuffer[1] = 0;            // Stratum
