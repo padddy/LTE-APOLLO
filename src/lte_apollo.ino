@@ -5,6 +5,7 @@
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
 #include <RTCZero.h>
+#include <ArduinoHttpClient.h>
 #include "config.h"
 
 #ifdef DEBUG_SERIAL
@@ -21,6 +22,7 @@ NBClient client;
 GPRS gprs;
 NBFileUtils nbfs;
 RTCZero rtc;
+HttpClient timeClient(client, TIME_API_HOST, TIME_API_PORT);
 
 File dataFile;
 
@@ -90,10 +92,29 @@ bool initLTE() {
 }
 
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time...");
-  // In a real implementation this would obtain time via LTE
+  DEBUG_PRINTLN("Syncing time via LTE...");
+  timeClient.get(TIME_API_PATH);
+  int status = timeClient.responseStatusCode();
+  if (status != 200) {
+    DEBUG_PRINT("HTTP status: ");
+    DEBUG_PRINTLN(status);
+    timeClient.stop();
+    return false;
+  }
+  String body = timeClient.responseBody();
+  timeClient.stop();
+  int idx = body.indexOf("\"unixtime\":");
+  if (idx < 0) {
+    DEBUG_PRINTLN("Time parse error");
+    return false;
+  }
+  idx += 11; // length of "unixtime":
+  int endIdx = body.indexOf(',', idx);
+  unsigned long epoch = body.substring(idx, endIdx).toInt();
   rtc.begin();
-  rtc.setEpoch(0);
+  rtc.setEpoch(epoch);
+  DEBUG_PRINT("Epoch: ");
+  DEBUG_PRINTLN(epoch);
   DEBUG_PRINTLN("Time synced");
   return true;
 }

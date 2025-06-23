@@ -13,6 +13,9 @@ Die Werte werden im CSV-Format in Tagesdateien gespeichert. Statusmeldungen und
 Messdaten können an einen FTP-Server gesendet werden. Das Programm ist als
 Grundlage gedacht und muss ggf. an die eigenen Anforderungen angepasst werden.
 
+Die Uhrzeit wird regelmäßig über eine LTE-Datenverbindung von
+`worldtimeapi.org` abgefragt und mit der internen RTC synchronisiert.
+
 ### Debug
 Durch Aktivieren von `DEBUG_SERIAL` in `config.h` werden Statusmeldungen über die
 serielle Schnittstelle ausgegeben (Baudrate siehe `DEBUG_BAUD`).

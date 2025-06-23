@@ -35,6 +35,11 @@
 #define TIME_SYNC_INTERVAL_MIN 60
 #define DAILY_UPLOAD_TIME "23:55:00"
 
+// Time API for LTE synchronization
+#define TIME_API_HOST "worldtimeapi.org"
+#define TIME_API_PORT 80
+#define TIME_API_PATH "/api/timezone/Etc/UTC"
+
 #define SOFTWARE_VERSION "1.0"
 
 // Debugging over serial monitor
