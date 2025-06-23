@@ -236,7 +236,7 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-  digitalWrite(LED_PIN, LOW);
+  digitalWrite(LED_PIN, HIGH); // LED on during initialization
 
 #ifdef DEBUG_SERIAL
   Serial.begin(DEBUG_BAUD);
@@ -249,18 +249,22 @@ void setup() {
   delay(15000);
   if (!initLTE()) {
     blinkError(4);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
   }
   DEBUG_PRINTLN("LTE initialized");
   if (!syncTime()) {
     blinkError(4);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
   }
   DEBUG_PRINTLN("Time synchronized");
   if (!checkBME()) {
     blinkError(3);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
   }
   DEBUG_PRINTLN("BME280 ready");
   if (!initSD()) {
     blinkError(3);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
   }
   DEBUG_PRINTLN("SD card ready");
   String statName = String(SENSOR_ID) + "_stat0.txt";
@@ -276,10 +280,11 @@ void setup() {
   lastMinute = millis();
   lastHour = millis();
   DEBUG_PRINTLN("Initialization complete");
+  digitalWrite(LED_PIN, LOW); // LED off before entering measurement loop
 }
 
 void loop() {
-  DEBUG_PRINTLN("Loop start");
+  // DEBUG_PRINTLN("Loop start");
   if (!SD.begin(PIN_SD_CS)) {
     digitalWrite(LED_PIN, LOW);
     DEBUG_PRINTLN("SD card not present");
@@ -326,6 +331,6 @@ void loop() {
   digitalWrite(LED_PIN, HIGH);
   delay(10);
   digitalWrite(LED_PIN, LOW);
-  DEBUG_PRINTLN("Measurement done");
+  // DEBUG_PRINTLN("Measurement done");
   delay(1000);
 }
