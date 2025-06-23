@@ -36,7 +36,7 @@
 #define DAILY_UPLOAD_TIME "23:55:00"
 
 // NTP server configuration for time synchronization
-#define NTP_SERVER_IP {192.53.103.108} // ptbtime1.ptb.de
+#define NTP_SERVER_IP {192, 53, 103, 108} // ptbtime1.ptb.de
 #define NTP_LOCAL_PORT 2390
 
 #define SOFTWARE_VERSION "1.0"
