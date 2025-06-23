@@ -20,13 +20,17 @@
 #define HUM_MIN 10
 #define HUM_MAX 100
 
-// Communication
 #define FTP_SERVER "ftp.example.com"
 #define FTP_USER "user"
 #define FTP_PASS "pass"
 #define FTP_PORT 21
 #define FTP_STAT_DIR "/status"
 #define FTP_DATA_DIR "/data"
+
+// Time API for LTE time synchronization
+#define TIME_API_HOST "timeapi.io"
+#define TIME_API_PORT 80
+#define TIME_API_PATH "/api/Time/current/zone?timeZone=UTC"
 
 #define SIM_PIN "1234"
 #define SIM_APN "apn"
@@ -35,9 +39,6 @@
 #define TIME_SYNC_INTERVAL_MIN 60
 #define DAILY_UPLOAD_TIME "23:55:00"
 
-// NTP server configuration for time synchronization
-#define NTP_SERVER_IP {192, 53, 103, 108} // ptbtime1.ptb.de
-#define NTP_LOCAL_PORT 2390
 
 #define SOFTWARE_VERSION "1.0"
 

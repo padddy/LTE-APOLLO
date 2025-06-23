@@ -4,6 +4,7 @@
 #include <SD.h>
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
+#include <ArduinoHttpClient.h>
 #include <RTCZero.h>
 #include "config.h"
 
@@ -19,20 +20,18 @@ Adafruit_BME280 bme;
 NB nbAccess;
 NBClient client;
 GPRS gprs;
-NBFileUtils nbfs;
 RTCZero rtc;
-NBUDP Udp;
-IPAddress ntpServer NTP_SERVER_IP;
-unsigned int localPort = NTP_LOCAL_PORT;
-const int NTP_PACKET_SIZE = 48;
-byte packetBuffer[NTP_PACKET_SIZE];
-long timeDiffMs = 0; // difference between NTP time and RTC in ms
+NBClient httpClient;
+HttpClient http(httpClient, TIME_API_HOST, TIME_API_PORT);
+long timeDiffMs = 0; // difference between HTTP time and RTC in ms
 
 File dataFile;
 
 unsigned long lastMinute = 0;
 unsigned long lastHour = 0;
 unsigned long startDay = 0;
+String currentDayStamp;
+String currentFile;
 
 // Helpers to access RTC values in a familiar way
 int year() { return rtc.getYear() + 2000; }
@@ -95,47 +94,32 @@ bool initLTE() {
   return true;
 }
 
-unsigned long sendNTPpacket(IPAddress &address) {
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  packetBuffer[0] = 0b11100011;
-  packetBuffer[1] = 0;
-  packetBuffer[2] = 6;
-  packetBuffer[3] = 0xEC;
-  packetBuffer[12] = 49;
-  packetBuffer[13] = 0x4E;
-  packetBuffer[14] = 49;
-  packetBuffer[15] = 52;
-  Udp.beginPacket(address, 123);
-  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  Udp.endPacket();
-  return millis();
-}
-
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via NTP...");
-  Udp.begin(localPort);
-  sendNTPpacket(ntpServer);
-  delay(1000);
-  if (Udp.parsePacket()) {
-    Udp.read(packetBuffer, NTP_PACKET_SIZE);
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    unsigned long secsSince1900 = (highWord << 16) | lowWord;
-    const unsigned long seventyYears = 2208988800UL;
-    unsigned long epoch = secsSince1900 - seventyYears;
-    rtc.begin();
-    unsigned long before = rtc.getEpoch();
-    timeDiffMs = ((long)epoch - (long)before) * 1000L;
-    rtc.setEpoch(epoch);
-    DEBUG_PRINT("Epoch: ");
-    DEBUG_PRINTLN(epoch);
-    DEBUG_PRINT("RTC diff ms: ");
-    DEBUG_PRINTLN(timeDiffMs);
-    DEBUG_PRINTLN("Time synced via NTP");
-    return true;
+  DEBUG_PRINTLN("Syncing time via HTTP...");
+  http.get(TIME_API_PATH);
+  int status = http.responseStatusCode();
+  if (status != 200) {
+    DEBUG_PRINT("HTTP error: ");
+    DEBUG_PRINTLN(status);
+    return false;
   }
-  DEBUG_PRINTLN("NTP no response");
-  return false;
+  String body = http.responseBody();
+  int idx = body.indexOf("\"epochSeconds\":");
+  if (idx < 0) idx = body.indexOf("\"unixtime\":");
+  if (idx < 0) return false;
+  idx = body.indexOf(':', idx);
+  int end = body.indexOf(',', idx);
+  unsigned long epoch = body.substring(idx + 1, end).toInt();
+  rtc.begin();
+  unsigned long before = rtc.getEpoch();
+  timeDiffMs = ((long)epoch - (long)before) * 1000L;
+  rtc.setEpoch(epoch);
+  DEBUG_PRINT("Epoch: ");
+  DEBUG_PRINTLN(epoch);
+  DEBUG_PRINT("RTC diff ms: ");
+  DEBUG_PRINTLN(timeDiffMs);
+  DEBUG_PRINTLN("Time synced via HTTP");
+  return true;
 }
 
 bool initSD() {
@@ -194,19 +178,20 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
   delay(200);
   ftp.print("TYPE I\r\n");
   delay(200);
-  ftp.print("EPSV\r\n");
+  ftp.print("PASV\r\n");
   delay(500);
 
   String resp = "";
   while (ftp.available()) resp += (char)ftp.read();
-  int dataPort;
-  if (sscanf(resp.c_str(), "229 Entering Extended Passive Mode (|||%d|)",
-             &dataPort) != 1) {
+  int ip1,ip2,ip3,ip4,p1,p2;
+  if (sscanf(resp.c_str(), "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
+             &ip1,&ip2,&ip3,&ip4,&p1,&p2) != 6) {
     ftp.stop();
     f.close();
-    DEBUG_PRINTLN("EPSV parse failed");
+    DEBUG_PRINTLN("PASV parse failed");
     return false;
   }
+  int dataPort = p1*256 + p2;
   NBClient data;
   if (!data.connect(FTP_SERVER, dataPort)) {
     ftp.stop();
@@ -279,6 +264,8 @@ void setup() {
   startDay = millis();
   lastMinute = millis();
   lastHour = millis();
+  currentDayStamp = timeStamp();
+  currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
   DEBUG_PRINTLN("Initialization complete");
   digitalWrite(LED_PIN, LOW); // LED off before entering measurement loop
 }
@@ -303,8 +290,7 @@ void loop() {
   }
 
   if (millis() - lastMinute >= 60000) {
-    String filename = String(SENSOR_ID) + timeStamp() + ".csv";
-    dataFile = SD.open(filename, FILE_WRITE);
+    dataFile = SD.open(currentFile, FILE_WRITE);
     appendData(dataFile);
     dataFile.close();
     DEBUG_PRINTLN("Data logged");
@@ -323,8 +309,10 @@ void loop() {
   }
 
   if (millis() - startDay >= 86400000) {
-    // TODO: upload yesterday file via FTP
+    ftpUpload(currentFile, FTP_DATA_DIR);
     DEBUG_PRINTLN("Daily upload trigger");
+    currentDayStamp = timeStamp();
+    currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
     startDay += 86400000;
   }
 
