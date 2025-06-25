@@ -9,6 +9,9 @@
 #define PIN_SD_CS 4
 #define LED_PIN LED_BUILTIN
 #define BME_ADDRESS 0x76
+#define BME_TEMP_OFFSET 0.0
+#define BME_PRESS_OFFSET 0.0
+#define BME_HUM_OFFSET 0.0
 #define NTC_BETA 3976
 #define NTC_OFFSET 0.0
 
@@ -39,6 +42,7 @@
 // Intervals
 #define TIME_SYNC_INTERVAL_MIN 60
 #define DAILY_UPLOAD_TIME "23:55:00"
+#define WATCHDOG_TIMEOUT_MS 300000UL
 
 
 #define SOFTWARE_VERSION "1.0"

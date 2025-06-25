@@ -1,9 +1,9 @@
 # LTE-APOLLO
 
-Dieses Projekt demonstriert eine einfache Firmware für den Arduino MKR NB 1500.
-Der Sensor erfasst Temperatur, Druck und Feuchte mit einem BME280 sowie eine
-Temperatur über einen NTC. Die Daten werden auf einer SD-Karte gespeichert und
-per LTE auf einen FTP-Server hochgeladen.
+Dieses Projekt demonstriert eine Firmware für den Arduino MKR NB 1500.
+Ein BME280 ermittelt Temperatur, Druck und Luftfeuchte, ein NTC misst an A0 eine
+weitere Temperatur. Die Messwerte werden auf einer SD-Karte abgelegt und
+täglich per LTE auf einen FTP-Server hochgeladen.
 
 ## Struktur
 - `include/config.h` – Konfiguration und Pins
