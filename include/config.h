@@ -30,10 +30,9 @@
 #define FTP_STAT_DIR "/status"
 #define FTP_DATA_DIR "/data"
 
-// HTTP time server for synchronization
-#define TIME_HOST "timeapi.io"
-#define TIME_PORT 80
-#define TIME_PATH "/api/Time/current/zone?timeZone=UTC"
+// NTP server configuration for time synchronization
+#define NTP_SERVER_IP {192, 53, 103, 108} // ptbtime1.ptb.de
+#define NTP_LOCAL_PORT 2390
 
 #define SIM_PIN "1234"
 #define SIM_APN "apn"

@@ -5,7 +5,7 @@
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
 #include <RTCZero.h>
-#include <ArduinoHttpClient.h>
+#include <NBUDP.h>
 #include "config.h"
 
 #ifdef DEBUG_SERIAL
@@ -18,10 +18,10 @@
 
 Adafruit_BME280 bme;
 NB nbAccess;
-NBClient client;
 GPRS gprs;
+NBUDP udp;
 RTCZero rtc;
-long timeDiffMs = 0; // difference between HTTP time and RTC in ms
+long timeDiffMs = 0; // difference between NTP time and RTC in ms
 
 File dataFile;
 
@@ -30,6 +30,10 @@ unsigned long lastHour = 0;
 unsigned long startDay = 0;
 String currentDayStamp;
 String currentFile;
+
+IPAddress ntpServer = IPAddress NTP_SERVER_IP;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
 
 // Helpers to access RTC values in a familiar way
 int year() { return rtc.getYear() + 2000; }
@@ -67,6 +71,22 @@ float readBattery() {
   return raw * (2.0 * 3.3 / 1023.0); // 100k/100k divider
 }
 
+unsigned long sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  udp.beginPacket(address, 123);
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+  return millis();
+}
+
 bool checkBME() {
   DEBUG_PRINTLN("Checking BME280...");
   if (!bme.begin(BME_ADDRESS)) {
@@ -98,42 +118,33 @@ bool initLTE() {
 
 
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via HTTP...");
-  NBClient netClient;
-  HttpClient http(netClient, TIME_HOST, TIME_PORT);
-  int rc = http.get(TIME_PATH);
-  if (rc != 0) {
-    DEBUG_PRINTLN("HTTP GET failed");
-    http.stop();
-    return false;
+  DEBUG_PRINTLN("Syncing time via NTP...");
+  udp.begin(NTP_LOCAL_PORT);
+  sendNTPpacket(ntpServer);
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    if (udp.parsePacket()) {
+      udp.read(packetBuffer, NTP_PACKET_SIZE);
+      unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+      unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);
+      const unsigned long seventyYears = 2208988800UL;
+      unsigned long epoch = (highWord << 16 | lowWord) - seventyYears;
+      rtc.begin();
+      unsigned long before = rtc.getEpoch();
+      timeDiffMs = ((long)epoch - (long)before) * 1000L;
+      rtc.setEpoch(epoch);
+      DEBUG_PRINT("Epoch: ");
+      DEBUG_PRINTLN(epoch);
+      DEBUG_PRINT("RTC diff ms: ");
+      DEBUG_PRINTLN(timeDiffMs);
+      DEBUG_PRINTLN("Time synced via NTP");
+      udp.stop();
+      return true;
+    }
   }
-  int status = http.responseStatusCode();
-  if (status != 200) {
-    DEBUG_PRINT("HTTP status: ");
-    DEBUG_PRINTLN(status);
-    http.stop();
-    return false;
-  }
-  String body = http.responseBody();
-  http.stop();
-  int idx = body.indexOf("epoch");
-  if (idx < 0) {
-    DEBUG_PRINTLN("No epoch in response");
-    return false;
-  }
-  idx = body.indexOf(":", idx);
-  if (idx < 0) return false;
-  unsigned long epoch = body.substring(idx+1).toInt();
-  rtc.begin();
-  unsigned long before = rtc.getEpoch();
-  timeDiffMs = ((long)epoch - (long)before) * 1000L;
-  rtc.setEpoch(epoch);
-  DEBUG_PRINT("Epoch: ");
-  DEBUG_PRINTLN(epoch);
-  DEBUG_PRINT("RTC diff ms: ");
-  DEBUG_PRINTLN(timeDiffMs);
-  DEBUG_PRINTLN("Time synced via HTTP");
-  return true;
+  udp.stop();
+  DEBUG_PRINTLN("No NTP response");
+  return false;
 }
 
 bool initSD() {
