@@ -218,19 +218,32 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
   readResp(resp);
   ftp.print("TYPE I\r\n");
   readResp(resp);
-  ftp.print("EPSV\r\n");
+  ftp.print("PASV\r\n");
   readResp(resp);
 
-  int start = resp.indexOf("(|||") + 4;
-  int end = resp.indexOf("|)", start);
+  int p1 = resp.indexOf('(');
+  int p2 = resp.indexOf(')', p1);
   int dataPort = 0;
-  if (start >= 4 && end > start) {
-    dataPort = resp.substring(start, end).toInt();
+  if (p1 >= 0 && p2 > p1) {
+    String nums = resp.substring(p1 + 1, p2);
+    int parts[6];
+    int idx = 0;
+    int last = 0;
+    for (int i = 0; i < nums.length() && idx < 6; i++) {
+      if (nums[i] == ',') {
+        parts[idx++] = nums.substring(last, i).toInt();
+        last = i + 1;
+      }
+    }
+    if (idx == 5) {
+      parts[idx] = nums.substring(last).toInt();
+      dataPort = parts[4] * 256 + parts[5];
+    }
   }
   if (dataPort == 0) {
     ftp.stop();
     f.close();
-    DEBUG_PRINTLN("EPSV parse failed");
+    DEBUG_PRINTLN("PASV parse failed");
     return false;
   }
 
@@ -264,6 +277,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   digitalWrite(LED_PIN, HIGH); // LED on during initialization
+  rtc.begin();
 
 #ifdef DEBUG_SERIAL
   Serial.begin(DEBUG_BAUD);
@@ -301,6 +315,8 @@ void setup() {
   DEBUG_PRINTLN("Writing stat file");
   for (int i = 0; i < 3; ++i) {
     appendStatusData(stat);
+    stat.flush();
+    delay(1000);
   }
   stat.close();
   ftpUpload(statName, FTP_STAT_DIR);
