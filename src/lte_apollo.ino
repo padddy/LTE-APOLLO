@@ -5,6 +5,7 @@
 #include <Adafruit_BME280.h>
 #include <MKRNB.h>
 #include <RTCZero.h>
+#include <ArduinoHttpClient.h>
 #include "config.h"
 
 #ifdef DEBUG_SERIAL
@@ -20,10 +21,7 @@ NB nbAccess;
 NBClient client;
 GPRS gprs;
 RTCZero rtc;
-NBUDP udp;
-const int NTP_PACKET_SIZE = 48;
-byte packetBuffer[NTP_PACKET_SIZE];
-long timeDiffMs = 0; // difference between NTP time and RTC in ms
+long timeDiffMs = 0; // difference between HTTP time and RTC in ms
 
 File dataFile;
 
@@ -90,7 +88,7 @@ bool initLTE() {
     DEBUG_PRINTLN("NB begin failed");
     return false;
   }
-  if (gprs.attachGPRS(SIM_APN, SIM_USER, SIM_PASS) != GPRS_READY) {
+  if (gprs.attachGPRS() != GPRS_READY) {
     DEBUG_PRINTLN("GPRS attach failed");
     return false;
   }
@@ -98,37 +96,34 @@ bool initLTE() {
   return true;
 }
 
-unsigned long sendNTPpacket(const IPAddress &address) {
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;            // Stratum
-  packetBuffer[2] = 6;            // Polling Interval
-  packetBuffer[3] = 0xEC;         // Precision
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-  udp.beginPacket(address, 123);
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
-  udp.endPacket();
-  return millis();
-}
 
 bool syncTime() {
-  DEBUG_PRINTLN("Syncing time via NTP...");
-  udp.begin(NTP_LOCAL_PORT);
-  sendNTPpacket(NTP_SERVER_IP);
-  delay(1000);
-  if (!udp.parsePacket()) {
-    DEBUG_PRINTLN("No NTP response");
+  DEBUG_PRINTLN("Syncing time via HTTP...");
+  NBClient netClient;
+  HttpClient http(netClient, TIME_HOST, TIME_PORT);
+  int rc = http.get(TIME_PATH);
+  if (rc != 0) {
+    DEBUG_PRINTLN("HTTP GET failed");
+    http.stop();
     return false;
   }
-  udp.read(packetBuffer, NTP_PACKET_SIZE);
-  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-  unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);
-  unsigned long secsSince1900 = (highWord << 16) | lowWord;
-  const unsigned long seventyYears = 2208988800UL;
-  unsigned long epoch = secsSince1900 - seventyYears;
+  int status = http.responseStatusCode();
+  if (status != 200) {
+    DEBUG_PRINT("HTTP status: ");
+    DEBUG_PRINTLN(status);
+    http.stop();
+    return false;
+  }
+  String body = http.responseBody();
+  http.stop();
+  int idx = body.indexOf("epoch");
+  if (idx < 0) {
+    DEBUG_PRINTLN("No epoch in response");
+    return false;
+  }
+  idx = body.indexOf(":", idx);
+  if (idx < 0) return false;
+  unsigned long epoch = body.substring(idx+1).toInt();
   rtc.begin();
   unsigned long before = rtc.getEpoch();
   timeDiffMs = ((long)epoch - (long)before) * 1000L;
@@ -137,7 +132,7 @@ bool syncTime() {
   DEBUG_PRINTLN(epoch);
   DEBUG_PRINT("RTC diff ms: ");
   DEBUG_PRINTLN(timeDiffMs);
-  DEBUG_PRINTLN("Time synced via NTP");
+  DEBUG_PRINTLN("Time synced via HTTP");
   return true;
 }
 

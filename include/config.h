@@ -30,9 +30,10 @@
 #define FTP_STAT_DIR "/status"
 #define FTP_DATA_DIR "/data"
 
-// NTP server for time synchronization via UDP
-#define NTP_SERVER_IP IPAddress(129, 6, 15, 28) // time.nist.gov
-#define NTP_LOCAL_PORT 2390
+// HTTP time server for synchronization
+#define TIME_HOST "timeapi.io"
+#define TIME_PORT 80
+#define TIME_PATH "/api/Time/current/zone?timeZone=UTC"
 
 #define SIM_PIN "1234"
 #define SIM_APN "apn"
