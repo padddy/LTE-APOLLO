@@ -33,6 +33,8 @@
 
 #define SIM_PIN "1234"
 #define SIM_APN "apn"
+#define SIM_USER ""
+#define SIM_PASS ""
 
 // Intervals
 #define TIME_SYNC_INTERVAL_MIN 60

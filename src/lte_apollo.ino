@@ -86,8 +86,12 @@ bool checkBME() {
 
 bool initLTE() {
   DEBUG_PRINTLN("Initializing LTE...");
-  if (nbAccess.begin(SIM_PIN, SIM_APN) != NB_READY) {
-    DEBUG_PRINTLN("LTE init failed");
+  if (nbAccess.begin(SIM_PIN) != NB_READY) {
+    DEBUG_PRINTLN("NB begin failed");
+    return false;
+  }
+  if (gprs.attachGPRS(SIM_APN, SIM_USER, SIM_PASS) != GPRS_READY) {
+    DEBUG_PRINTLN("GPRS attach failed");
     return false;
   }
   DEBUG_PRINTLN("LTE ready");
@@ -187,17 +191,30 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
     return false;
   }
 
-  ftp.print("USER " FTP_USER "\r\n");
-  delay(200);
-  ftp.print("PASS " FTP_PASS "\r\n");
-  delay(200);
-  ftp.print("TYPE I\r\n");
-  delay(200);
-  ftp.print("EPSV\r\n");
-  delay(500);
+  String resp;
 
-  String resp = "";
-  while (ftp.available()) resp += (char)ftp.read();
+  auto readResp = [&](String &out, unsigned long timeout = 5000) {
+    out = "";
+    unsigned long start = millis();
+    while (millis() - start < timeout) {
+      while (ftp.available()) {
+        char c = ftp.read();
+        out += c;
+        start = millis();
+      }
+    }
+  };
+
+  readResp(resp); // greeting
+  ftp.print("USER " FTP_USER "\r\n");
+  readResp(resp);
+  ftp.print("PASS " FTP_PASS "\r\n");
+  readResp(resp);
+  ftp.print("TYPE I\r\n");
+  readResp(resp);
+  ftp.print("EPSV\r\n");
+  readResp(resp);
+
   int start = resp.indexOf("(|||") + 4;
   int end = resp.indexOf("|)", start);
   int dataPort = 0;
@@ -210,6 +227,7 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
     DEBUG_PRINTLN("EPSV parse failed");
     return false;
   }
+
   NBClient data;
   if (!data.connect(FTP_SERVER, dataPort)) {
     ftp.stop();
@@ -223,7 +241,7 @@ bool ftpUpload(const String &localName, const char *remoteDir) {
   ftp.print("/");
   ftp.print(localName);
   ftp.print("\r\n");
-  delay(200);
+  readResp(resp);
 
   while (f.available()) {
     data.write(f.read());
