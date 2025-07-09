@@ -402,7 +402,7 @@ void setup() {
   rtc.begin();
 
 #ifdef DEBUG_SERIAL
-  Serial.begin(DEBUG_BAUD);
+  //Serial.begin(DEBUG_BAUD);
   while (!Serial) {
     ;
   }
