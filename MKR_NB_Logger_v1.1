@@ -1,0 +1,857 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <SD.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_SHT31.h>
+#include <MKRNB.h>
+#include <RTCZero.h>
+#include <NBUDP.h>
+#include "config.h"
+
+#ifdef DEBUG_SERIAL
+// ---- Zeitpräfix vor jeder neuen Debug-Zeile ----
+static bool DBG_lineStart = true;
+
+static inline void DBG_prefix() {
+  if (DBG_lineStart) {
+    unsigned long ms  = millis();
+    unsigned long sec = ms / 1000;
+    unsigned long rem = ms % 1000;
+    char ts[20];
+    sprintf(ts, "[%lu.%03lu] ", sec, rem);  // z.B. [123.456]
+    Serial.print(ts);
+    DBG_lineStart = false;
+  }
+}
+
+#define DEBUG_PRINT(x)    do { DBG_prefix(); Serial.print(x); } while(0)
+#define DEBUG_PRINTLN(x)  do { DBG_prefix(); Serial.println(x); DBG_lineStart = true; } while(0)
+#else
+#define DEBUG_PRINT(x)    do {} while(0)
+#define DEBUG_PRINTLN(x)  do {} while(0)
+#endif
+
+Adafruit_SHT31 sht31;
+bool hasSHT85 = false;
+Adafruit_BME280 bme;
+NB nbAccess;
+GPRS gprs;
+NBUDP udp;
+RTCZero rtc;
+long timeDiffMs = 0; // difference between NTP time and RTC in ms
+
+File dataFile;
+
+bool sdMounted = false;
+bool runMainLoop = true;
+
+unsigned long lastMinute = 0;
+unsigned long lastHour = 0;
+unsigned long startDay = 0;
+String currentDayStamp;
+String currentFile;
+const char* DATA_HEADER = "DATE;TIME;NTC_T;BME_T;BME_P;BME_H;SHT_T;SHT_H;BATT_V";
+
+// --- Daily sync schedule (02:00) ---
+int lastDailySyncYmd = -1;  // yyyy*10000 + mm*100 + dd, um Mehrfachtrigger zu verhindern
+
+bool lteActive = false;   // true, wenn initLTE() bis inkl. GPRS erfolgreich war
+
+// Date-Helfer
+bool isLeap(int y){ return (y%4==0 && (y%100!=0 || y%400==0)); }
+int daysInMonth(int y,int m){
+  static const int d[12]={31,28,31,30,31,30,31,31,30,31,30,31};
+  if(m==2) return d[m-1]+(isLeap(y)?1:0); else return d[m-1];
+}
+void ymdYesterday(int &y,int &m,int &d){
+  if(--d==0){ if(--m==0){ m=12; y--; } d = daysInMonth(y,m); }
+}
+int ymdInt(int y,int m,int d){ return y*10000 + m*100 + d; }
+
+String makeDayFileName(int y,int m,int d){
+  char stamp[7]; // YYMMDD
+  sprintf(stamp,"%02d%02d%02d", y%100, m, d);
+  return String(SENSOR_ID) + String(stamp) + ".csv";
+}
+
+long lastTimeDiffMs = 0;
+long lastSyncEpoch = 0;
+long thisSyncEpoch = 0;
+
+IPAddress ntpServer = IPAddress NTP_SERVER_IP;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+bool udpReady = false;
+
+
+// Helpers to access RTC values in a familiar way
+int year() { return rtc.getYear() + 2000; }
+int month() { return rtc.getMonth(); }
+int day() { return rtc.getDay(); }
+int hour() { return rtc.getHours(); }
+int minute() { return rtc.getMinutes(); }
+int second() { return rtc.getSeconds(); }
+
+unsigned long sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  udp.beginPacket(address, 123);
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+  return millis();
+}
+
+bool waitForIP(unsigned long ms=8000) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    IPAddress ip = gprs.getIPAddress();
+    if (ip[0] || ip[1] || ip[2] || ip[3]) {   // != 0.0.0.0
+      DEBUG_PRINT("PDP local IP: "); DEBUG_PRINTLN(ip);
+      return true;
+    }
+    delay(250);
+  }
+  DEBUG_PRINTLN("No IP from PDP (0.0.0.0)");
+  return false;
+}
+
+bool datapathOK() {
+  NBClient c;
+  DEBUG_PRINT("TCP probe "); DEBUG_PRINT(FTP_SERVER); DEBUG_PRINTLN(":21");
+  if (!c.connect(FTP_SERVER, 21)) {
+    DEBUG_PRINTLN("TCP connect failed");
+    c.stop();
+    return false;
+  }
+  String resp; unsigned long t0=millis();
+  while (millis()-t0 < 8000) {
+    while (c.available()) {
+      char ch = c.read(); resp += ch;
+      if (resp.length() > 384) resp.remove(0, resp.length()-256);
+      if (resp.indexOf("220") != -1) {
+        DEBUG_PRINTLN("FTP banner 220 seen → TCP OK");
+        c.stop();
+        return true;
+      }
+    }
+    delay(10);
+  }
+  DEBUG_PRINTLN("No 220 banner (firewall/server/DNS?)");
+  c.stop();
+  return false;
+}
+
+//-------------------------------------------------------------------------------------------Funktionen------------------------------------------------------------------
+
+void blinkError(int hz) {
+  int delayMs = 500 / hz;
+  for (int i = 0; i < hz*2; ++i) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(delayMs);
+  }
+  digitalWrite(LED_PIN, LOW);
+}
+
+float readNTC() {
+  int raw = analogRead(PIN_NTC);
+  float resistance = (10000.0 * raw) / (1023.0 - raw); // <-- Diese Zeile geändert!
+  float steinhart;
+  steinhart = resistance / 10000.0;
+  steinhart = log(steinhart);
+  steinhart /= NTC_BETA;
+  steinhart += 1.0 / (25.0 + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+  steinhart += NTC_OFFSET;
+  return steinhart;
+}
+
+
+float readBattery() {
+  int raw = analogRead(PIN_BAT);
+  return raw * (2.0 * 3.3 / 1023.0); // 100k/100k divider
+}
+
+
+void readSHT85(float &t, float &h) {
+  t = NAN; h = NAN;
+  if (!hasSHT85) return;
+
+  t = sht31.readTemperature();
+  h = sht31.readHumidity();
+
+  if (isnan(t) || isnan(h)) {
+    delay(20);
+    t = sht31.readTemperature();
+    h = sht31.readHumidity();
+  }
+
+  // einfache Plausi (optional)
+  if (!(t > -45.0f && t < 130.0f)) t = NAN;
+  if (!(h >= 0.0f && h <= 100.0f)) h = NAN;
+}
+
+
+bool checkBME() {
+  DEBUG_PRINTLN("Checking BME280...");
+  Wire.begin();
+  Wire.setClock(100000); // konservativ
+  // Falls Adresse variabel ist: erst 0x76, dann 0x77 probieren
+  if (!bme.begin(BME_ADDRESS, &Wire)) {
+    // optional: zweite Adresse probieren
+    #if defined(BME_ALT_ADDRESS)
+    if (!bme.begin(BME_ALT_ADDRESS, &Wire)) {
+      DEBUG_PRINTLN("BME280 not found");
+      return false;
+    }
+    #else
+    DEBUG_PRINTLN("BME280 not found");
+    return false;
+    #endif
+  }
+
+  // ein paar Messversuche
+  for (int i = 0; i < 3; ++i) { delay(20); bme.readTemperature(); }
+
+  float t = bme.readTemperature();
+  float p = bme.readPressure() / 100.0;
+  float h = bme.readHumidity();
+
+  if (isnan(t) || isnan(p) || isnan(h)) {
+    DEBUG_PRINTLN("BME280 returns NaN");
+    return false;
+  }
+  if (!(t > TEMP_MIN && t < TEMP_MAX &&
+        p > PRESS_MIN && p < PRESS_MAX &&
+        h > HUM_MIN && h < HUM_MAX)) {
+    DEBUG_PRINTLN("BME280 sanity check failed");
+    return false;
+  }
+
+  DEBUG_PRINTLN("BME280 ready");   // <- Erfolgsmeldung HIER
+  return true;
+}
+
+
+bool initLTE() {
+  DEBUG_PRINTLN("Initializing LTE...");
+
+  // Modemstart (3 Versuche)
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    DEBUG_PRINT("NB begin attempt "); DEBUG_PRINTLN(attempt);
+    if (nbAccess.begin(SIM_PIN) == NB_READY) {
+      DEBUG_PRINTLN("NB ready");
+      break;
+    }
+    DEBUG_PRINTLN("NB begin failed -> shutdown + retry");
+    nbAccess.shutdown();
+    delay(1500);
+    if (attempt == 3) return false;
+  }
+
+  // GPRS attach (APN aus config.h; falls nicht nötig, #undef NB_APN)
+  DEBUG_PRINTLN("Attaching GPRS...");
+
+#ifdef NB_APN
+  if (gprs.attachGPRS(NB_APN, NB_USER, NB_PASS) != GPRS_READY) {
+    DEBUG_PRINTLN("GPRS attach failed");
+    return false;
+  }
+#else
+  if (gprs.attachGPRS() != GPRS_READY) {
+    DEBUG_PRINTLN("GPRS attach failed");
+    return false;
+  }
+#endif
+
+// ✅ Hier sicherstellen, dass wirklich eine IP da ist
+if (!waitForIP(10000)) {
+  DEBUG_PRINTLN("GPRS ready but no IP → datapath likely broken");
+  // optional: einmal sauber neu versuchen
+  gprs.detachGPRS(); delay(1500);
+#ifdef NB_APN
+  if (gprs.attachGPRS(NB_APN, NB_USER, NB_PASS) != GPRS_READY || !waitForIP(8000)) return false;
+#else
+  if (gprs.attachGPRS() != GPRS_READY || !waitForIP(8000)) return false;
+#endif
+}
+
+DEBUG_PRINTLN("LTE ready");
+lteActive = true;
+return true;
+}
+
+
+void shutdownLTE() {
+  // Wenn Modem nie gestartet wurde: nichts „hartes“ tun
+  if (!lteActive) {
+    // UDP-Socket in jedem Fall freigeben, damit syncTime() neu bindet
+    udp.stop();
+    udpReady = false;
+    DEBUG_PRINTLN("shutdownLTE: modem not active; skipping power-down");
+    return;
+  }
+
+  // PDP-Kontext räumen (best effort)
+  gprs.detachGPRS();
+  delay(2000);
+
+  // Modem sauber runterfahren
+  nbAccess.shutdown();
+  delay(3000);
+
+  lteActive = false;
+
+  // UDP invalidieren (nächstes syncTime() macht udp.begin() neu)
+  udp.stop();
+  udpReady = false;
+
+  DEBUG_PRINTLN("shutdownLTE: done");
+}
+
+
+// Synchronisiert die RTC-Zeit mit einem NTP-Server über UDP.
+// Berechnet außerdem die Zeitabweichung und speichert die aktuellen/letzten Sync-Werte für spätere Vergleiche.
+bool syncTime() {
+  DEBUG_PRINTLN("Syncing time via NTP...");
+
+  const unsigned long NTP_TIMEOUT_MS = 15000UL; // LTE-M kann träge sein
+
+  // Sauber starten
+  udp.stop();
+  delay(300);
+
+  // Einmal binden (Port-Hopping, falls ein Port blockiert ist)
+  uint16_t base = 40000u + (millis() & 0x03FFu);
+  bool begun = false;
+  for (int i = 0; i < 4 && !begun; ++i) {
+    uint16_t lp = base + i * 7u;
+    begun = udp.begin(lp);
+    if (!begun) { DEBUG_PRINTLN("udp.begin failed"); delay(200); }
+  }
+  if (!begun) { DEBUG_PRINTLN("No NTP socket"); return false; }
+
+  for (int attempt = 1; attempt <= 2; ++attempt) {
+    DEBUG_PRINT("NTP attempt "); DEBUG_PRINTLN(attempt);
+
+    // Sendezeit (lokal, ms)
+    unsigned long t_send_ms = millis();
+    sendNTPpacket(ntpServer);
+
+    // Auf Antwort warten
+    unsigned long wait_start = millis();
+    while (millis() - wait_start < NTP_TIMEOUT_MS) {
+      int sz = udp.parsePacket();
+      if (sz >= NTP_PACKET_SIZE) {
+        unsigned long t_recv_ms = millis(); // Empfangszeit (lokal, ms)
+        udp.read(packetBuffer, NTP_PACKET_SIZE);
+
+        // Server-Transmit-Time: Sekunden seit 1900
+        uint32_t hw = word(packetBuffer[40], packetBuffer[41]);
+        uint32_t lw = word(packetBuffer[42], packetBuffer[43]);
+        const uint32_t SEVENTY_YEARS = 2208988800UL;
+        uint32_t t3_epoch_s = ((hw << 16) | lw) - SEVENTY_YEARS; // Unix seconds
+
+        // RTT/2 (ms)
+        uint32_t rtt_ms = t_recv_ms - t_send_ms;
+        uint32_t half_rtt_ms = rtt_ms / 2u;
+
+        // **Alles in 64-bit Millisekunden rechnen**
+        uint64_t t4_epoch_ms = (uint64_t)t3_epoch_s * 1000ULL + (uint64_t)half_rtt_ms; // Serverzeit zum Empfangsmoment
+        uint64_t rtc_now_ms  = (uint64_t)rtc.getEpoch() * 1000ULL;
+
+        int64_t diff_ms_64 = (int64_t)t4_epoch_ms - (int64_t)rtc_now_ms;
+
+        // globale timeDiffMs (32-bit) sicher setzen (Saturation auf 32-bit Range)
+        if (diff_ms_64 >  2147483647LL) diff_ms_64 =  2147483647LL;
+        if (diff_ms_64 < -2147483648LL) diff_ms_64 = -2147483648LL;
+        timeDiffMs = (long)diff_ms_64;
+
+        // RTC nur stellen, wenn Abweichung > 1000 ms
+        int64_t absdiff = (diff_ms_64 >= 0 ? diff_ms_64 : -diff_ms_64);
+        if (absdiff > 1000LL) {
+          rtc.setEpoch((uint32_t)(t4_epoch_ms / 1000ULL));
+        }
+
+        DEBUG_PRINT("NTP RTT [ms]: "); DEBUG_PRINTLN(rtt_ms);
+        DEBUG_PRINT("RTC diff [ms] (recv-moment): "); DEBUG_PRINTLN(timeDiffMs);
+        DEBUG_PRINTLN("Time synced via NTP");
+
+        udp.stop();
+        return true;
+      }
+      delay(50);
+    }
+
+    DEBUG_PRINTLN("NTP timeout on this attempt");
+  }
+
+  udp.stop();
+  DEBUG_PRINTLN("No NTP response");
+  return false;
+}
+
+
+
+bool initSD() {
+  DEBUG_PRINTLN("Initializing SD...");
+  SPI.begin();                     // sicherstellen
+  pinMode(PIN_SD_CS, OUTPUT);      // CS definieren
+  digitalWrite(PIN_SD_CS, HIGH);   // CS inaktiv
+
+  for (int i=0; i<3; ++i) {
+    if (SD.begin(PIN_SD_CS)) {
+      DEBUG_PRINTLN("SD card ready");    // <- nur hier loggen
+      return true;
+    }
+    DEBUG_PRINTLN("SD init failed, retry...");
+    delay(200);
+  }
+  DEBUG_PRINTLN("SD init failed");
+  return false;
+}
+
+String timeStamp() {
+  char buf[7];
+  sprintf(buf, "%02d%02d%02d", year() % 100, month(), day());
+  return String(buf);
+}
+
+void ensureDataFileHasHeader() {
+  File f = SD.open(currentFile, FILE_WRITE);
+  if (!f) return;
+  if (f.size() == 0) {
+    f.println(DATA_HEADER);
+    f.flush();
+  }
+  f.close();
+}
+
+void appendData(File &f) {
+  // Header, falls Datei neu/leer
+  if (f.size() == 0) {
+    f.println(DATA_HEADER);
+    f.flush();
+  }
+
+  float sht_t, sht_h;
+  readSHT85(sht_t, sht_h);
+
+  char buf[160];
+  // YYMMDD;HH:MM:SS;NTC_T;BME_T;BME_P;BME_H;SHT_T;SHT_H;BattV
+  snprintf(buf, sizeof(buf),
+           "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%s;%s;%.2f",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(),
+           (isnan(sht_t) ? "nan" : String(sht_t, 2).c_str()),
+           (isnan(sht_h) ? "nan" : String(sht_h, 2).c_str()),
+           readBattery());
+
+  f.println(buf);
+  DEBUG_PRINTLN(buf);
+}
+
+void appendStatusData(File &f) {
+  float sht_t, sht_h;
+  readSHT85(sht_t, sht_h);
+
+  char buf[160];
+  // Format: YYMMDD;HH:MM:SS;NTC_T;BME_T;BME_P;BME_H;SHT_T;SHT_H;BattV;TimeDiff
+  snprintf(buf, sizeof(buf),
+           "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%s;%s;%.2f;%ld",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(),
+           (isnan(sht_t) ? "nan" : String(sht_t, 2).c_str()),
+           (isnan(sht_h) ? "nan" : String(sht_h, 2).c_str()),
+           readBattery(),
+           timeDiffMs);
+
+  f.println(buf);
+  DEBUG_PRINTLN(buf);
+}
+
+
+bool ftpUpload(const String &localName, const char *remoteDir) {
+  DEBUG_PRINTLN("===== FTP UPLOAD START (PASV only, IP match) =====");
+
+  File f = SD.open(localName);
+  if (!f) { DEBUG_PRINTLN("FTP open failed"); return false; }
+  const size_t fileSize = f.size();
+
+  NBClient ctrl, data;
+  IPAddress dataIP;
+  int dataPort = 0;
+
+  // --- Helpers --------------------------------------------------------------
+
+  // Liest bis zum nächsten CRLF und liefert exakt diese Zeile (ohne CRLF)
+  auto readLine = [&](String &line, unsigned long timeout)->bool {
+    line = "";
+    unsigned long t0 = millis();
+    while (millis() - t0 < timeout) {
+      while (ctrl.available()) {
+        char c = ctrl.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+          return line.length() > 0;
+        }
+        line += c;
+        if (line.length() > 512) line.remove(0, line.length() - 256);
+      }
+      delay(10);
+    }
+    return line.length() > 0;
+  };
+
+  auto expectCode = [&](const char *code, unsigned long timeout)->bool {
+    String line;
+    if (!readLine(line, timeout)) return false;
+    DEBUG_PRINT("<< "); DEBUG_PRINTLN(line);
+    return line.startsWith(code); // akzeptiert z.B. "220" und "220-..."
+  };
+
+  // Daten-Socket verbinden (immer zu dataIP:dataPort, nie zum Hostnamen!)
+  auto connectDataSocket = [&](const IPAddress& ip, uint16_t port)->bool {
+    DEBUG_PRINT("Data target "); DEBUG_PRINT(ip); DEBUG_PRINT(":"); DEBUG_PRINTLN(port);
+    unsigned long start = millis();
+    while (millis() - start < 10000) {
+      if (data.connect(ip, port)) return true;
+      delay(100);
+    }
+    DEBUG_PRINTLN("Data connect failed");
+    return false;
+  };
+
+  // --- Control connect ------------------------------------------------------
+
+  DEBUG_PRINT("FTP ctrl connect "); DEBUG_PRINT(FTP_SERVER); DEBUG_PRINT(":"); DEBUG_PRINTLN(FTP_PORT);
+  if (!ctrl.connect(FTP_SERVER, FTP_PORT)) { f.close(); return false; }
+
+  if (!expectCode("220", 8000)) { ctrl.stop(); f.close(); return false; } // Banner
+
+  ctrl.print("USER " FTP_USER "\r\n");
+  // manche Server springen direkt zu 230 – 331 ist nice-to-have
+  (void)expectCode("331", 8000);
+
+  ctrl.print("PASS " FTP_PASS "\r\n");
+  if (!expectCode("230", 8000)) { ctrl.stop(); f.close(); return false; }
+
+  ctrl.print("TYPE I\r\n");
+  if (!expectCode("200", 6000)) { ctrl.stop(); f.close(); return false; }
+
+  // CWD (bei Bedarf MKD)
+  ctrl.print("CWD "); ctrl.print(remoteDir); ctrl.print("\r\n");
+  if (!expectCode("250", 6000)) {
+    ctrl.print("MKD "); ctrl.print(remoteDir); ctrl.print("\r\n");
+    { String dump; readLine(dump, 8000); } // kein Heap-Leak
+    ctrl.print("CWD "); ctrl.print(remoteDir); ctrl.print("\r\n");
+    if (!expectCode("250", 6000)) { ctrl.stop(); f.close(); return false; }
+  }
+
+  // --- Passive Aushandlung: PASV (227) erzwingen ---------------------------
+
+  auto getPassivePortPASV = [&]()->bool {
+    String line;
+    ctrl.print("PASV\r\n");
+    if (!readLine(line, 6000)) return false;
+    DEBUG_PRINT("<< "); DEBUG_PRINTLN(line);
+    if (!line.startsWith("227")) return false;
+
+    // Format: 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2).
+    int p1 = line.indexOf('('), p2 = line.indexOf(')', p1);
+    if (p1 < 0 || p2 < p1) return false;
+    int a1,a2,a3,a4,ph,pl; a1=a2=a3=a4=ph=pl=0;
+    // robust gegen Spaces: substring extrahieren
+    String inside = line.substring(p1+1, p2);
+    if (sscanf(inside.c_str(), "%d,%d,%d,%d,%d,%d", &a1,&a2,&a3,&a4,&ph,&pl) != 6) return false;
+    dataIP = IPAddress(a1,a2,a3,a4);
+    dataPort = (ph << 8) | pl;
+    return (dataPort > 0);
+  };
+
+  if (!getPassivePortPASV()) {
+    DEBUG_PRINTLN("PASV negotiation failed");
+    ctrl.stop(); f.close(); return false;
+  }
+
+  DEBUG_PRINT("Passive data port: "); DEBUG_PRINTLN(dataPort);
+
+  // --- Adaptiver STOR/Daten-Handshake --------------------------------------
+
+  // Versuch A: STOR → (warte 150/125) → dann Daten verbinden
+  bool have150 = false;
+  {
+    ctrl.print("STOR "); ctrl.print(localName); ctrl.print("\r\n");
+    String lineA;
+    unsigned long waitA = millis();
+    while (millis() - waitA < 6000) {
+      if (readLine(lineA, 1000)) {
+        DEBUG_PRINT("<< "); DEBUG_PRINTLN(lineA);
+        if (lineA.indexOf("150") != -1 || lineA.indexOf("125") != -1) { have150 = true; break; }
+        // andere 1xx/2xx ignorieren bis Timeout
+      }
+    }
+  }
+
+  if (have150) {
+    if (!connectDataSocket(dataIP, (uint16_t)dataPort)) { ctrl.stop(); f.close(); return false; }
+    DEBUG_PRINTLN("Data socket connected (A)");
+  } else {
+    // Fallback B: erst Daten verbinden, dann STOR erneut senden und 150/125 abwarten
+    DEBUG_PRINTLN("No 150 after STOR (A) → trying pre-connect (B)");
+    if (!connectDataSocket(dataIP, (uint16_t)dataPort)) { ctrl.stop(); f.close(); return false; }
+    DEBUG_PRINTLN("Data socket connected (B)");
+
+    ctrl.print("STOR "); ctrl.print(localName); ctrl.print("\r\n");
+    String lineB;
+    bool have150b = false;
+    unsigned long waitB = millis();
+    while (millis() - waitB < 10000) {
+      if (readLine(lineB, 1000)) {
+        DEBUG_PRINT("<< "); DEBUG_PRINTLN(lineB);
+        if (lineB.indexOf("150") != -1 || lineB.indexOf("125") != -1) { have150b = true; break; }
+      }
+    }
+    if (!have150b) {
+      DEBUG_PRINTLN("No 150/125 after STOR (B)");
+      data.stop(); ctrl.stop(); f.close(); return false;
+    }
+  }
+
+  // --- Transfer -------------------------------------------------------------
+
+  DEBUG_PRINTLN("Transferring file...");
+  unsigned long t0 = millis();
+  unsigned long overallDeadline = millis() + 60000; // max 60 s für den ganzen Upload
+  size_t totalBytes = 0;
+  uint8_t buf[128]; // kleinere Chunks sind über LTE-M stabiler
+
+  while (f.available() && millis() < overallDeadline) {
+    int len = f.read(buf, sizeof(buf));
+    if (len <= 0) break;
+
+    size_t sent = 0;
+    unsigned long deadline = millis() + 10000; // 10 s pro Chunk
+    while (sent < (size_t)len && millis() < deadline && millis() < overallDeadline) {
+      size_t w = data.write(buf + sent, len - sent);
+      if (w > 0) { sent += w; totalBytes += w; }
+      else { delay(5); }
+    }
+    if (sent < (size_t)len) { DEBUG_PRINTLN("Short write → abort"); break; }
+  }
+
+  data.stop();
+
+  // Best-effort: finalen 226 einsammeln
+  {
+    String lineEnd;
+    if (readLine(lineEnd, 5000)) { DEBUG_PRINT("<< "); DEBUG_PRINTLN(lineEnd); }
+  }
+
+  DEBUG_PRINT("Transfer time [ms]: "); DEBUG_PRINTLN(millis() - t0);
+  DEBUG_PRINT("Transferred bytes: ");  DEBUG_PRINTLN(totalBytes);
+
+  ctrl.print("QUIT\r\n");
+  { String line; readLine(line, 1500); }
+
+  ctrl.stop();
+  f.close();
+
+  DEBUG_PRINTLN("===== FTP UPLOAD END =====");
+  return (totalBytes == fileSize);
+}
+
+
+
+
+
+//----------------------------------------------------------SETUP------------------------------------------------------------
+
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  digitalWrite(LED_PIN, HIGH);
+  rtc.begin();
+
+#ifdef DEBUG_SERIAL
+  Serial.begin(DEBUG_BAUD);
+  unsigned long __t0 = millis();
+  while (!Serial && millis()-__t0 < 1500) {}
+  DEBUG_PRINTLN("\nStarting " SENSOR_ID " firmware " SOFTWARE_VERSION);
+#endif
+
+  shutdownLTE();      // sauberer Kaltstart
+  // Einmaliges LTE-Fenster für Boot: NTP -> danach Sensoren/SD -> Statfile -> Upload
+  // Einmaliges LTE-Fenster für Boot
+if (initLTE()) {
+  bool pathOK = datapathOK();
+
+  // Sensoren jetzt initialisieren (Zeit egal; wir loggen immer)
+  if (!checkBME()) { blinkError(3); DEBUG_PRINTLN("BME init failed"); }
+  if (sht31.begin(0x44)) { hasSHT85 = true; sht31.heater(false); DEBUG_PRINTLN("SHT85 ready (0x44)"); }
+  else { DEBUG_PRINTLN("SHT85 not found"); }
+
+  // SD mounten (immer, damit Logger läuft)
+  sdMounted = initSD();
+
+  if (pathOK) {
+    // NUR wenn Datapath OK: NTP + Status-Upload
+    if (syncTime()) DEBUG_PRINTLN("Boot time sync OK");
+    else            DEBUG_PRINTLN("Boot time sync FAILED");
+
+    if (sdMounted) {
+      String statName = String(SENSOR_ID) + "start.txt";
+      File stat = SD.open(statName, FILE_WRITE);
+      if (stat) {
+        appendStatusData(stat);
+        stat.close();
+        if (ftpUpload(statName, FTP_STAT_DIR)) {
+          DEBUG_PRINTLN("Boot status upload OK");
+          // Optional: SD.remove(statName);
+        } else {
+          DEBUG_PRINTLN("Boot status upload FAILED");
+        }
+      } else {
+        DEBUG_PRINTLN("Boot status file open failed");
+      }
+    } else {
+      DEBUG_PRINTLN("SD not mounted at boot");
+    }
+  } else {
+    DEBUG_PRINTLN("Datapath NOT OK → skipping NTP and FTP at boot");
+  }
+
+  shutdownLTE();  // EINMAL aus
+} else {
+  DEBUG_PRINTLN("LTE init FAILED at boot – skipping time sync & boot upload");
+  if (!checkBME()) { blinkError(3); }
+  if (sht31.begin(0x44)) { hasSHT85 = true; sht31.heater(false); }
+  sdMounted = initSD();
+}
+
+
+  // Tagesdatei für heute vorbereiten (Header sicherstellen)
+  currentDayStamp = timeStamp();
+  currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
+  ensureDataFileHasHeader();
+
+  startDay   = millis();
+  lastMinute = millis();
+ 
+  DEBUG_PRINTLN("Initialization complete");
+  digitalWrite(LED_PIN, LOW);
+}
+
+
+
+//------------------------------------------------LOOP------------------------------------------------
+
+
+void loop() {
+  if (!runMainLoop) {    // nur LED heartbeat
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(250);
+    return;
+  }
+
+//  if (!SD.begin(PIN_SD_CS)) {
+//    digitalWrite(LED_PIN, LOW);
+//    DEBUG_PRINTLN("SD card not present");
+//    delay(1000);
+//    return;
+//  }
+
+  if (!sdMounted) {
+   sdMounted = SD.begin(PIN_SD_CS);
+   if (!sdMounted) { DEBUG_PRINTLN("SD init failed"); delay(1000); return; }
+  }
+
+
+   if (digitalRead(PIN_BUTTON) == LOW) {
+    dataFile.close();
+    SD.end();
+    sdMounted = false;
+    DEBUG_PRINTLN("SD card unmounted");
+    while (digitalRead(PIN_BUTTON) == LOW) { delay(50); }
+    DEBUG_PRINTLN("Button released");
+    runMainLoop = false; //💡 Mainloop anhalten, ab jetzt nur blinken!
+    return;
+  }
+
+  // Tageswechsel erkennen -> neue Datei + Header
+static int lastYmd = -1;
+int nowYmd = ymdInt(year(), month(), day());
+if (lastYmd != nowYmd) {
+  lastYmd = nowYmd;
+  currentDayStamp = timeStamp();
+  currentFile = makeDayFileName(year(), month(), day());
+  ensureDataFileHasHeader();
+  DEBUG_PRINT("New day file: "); DEBUG_PRINTLN(currentFile);
+}
+
+
+ if (millis() - lastMinute >= 60000UL) {
+  File df = SD.open(currentFile, FILE_WRITE);
+  if (df) { appendData(df); df.close(); DEBUG_PRINTLN("Data logged"); }
+  else    { DEBUG_PRINTLN("Open data file failed"); }
+  lastMinute += 60000UL;
+}
+// 02:00: Timesync + Upload der VORTAGES-Datei
+if (hour()==2 && minute()==0) {
+  int todayY = year(), todayM = month(), todayD = day();
+  int key = ymdInt(todayY, todayM, todayD);
+  if (lastDailySyncYmd != key) {            // Flankenerkennung: nur 1x pro Tag
+    lastDailySyncYmd = key;
+
+    // gestern berechnen + Dateiname bilden
+    int y=todayY, m=todayM, d=todayD;
+    ymdYesterday(y,m,d);
+    String yestFile = makeDayFileName(y,m,d);
+    DEBUG_PRINT("Daily job 02:00 → yesterday: "); DEBUG_PRINTLN(yestFile);
+
+    shutdownLTE();      // sauberer Kaltstart
+    // LTE für gesamten Job EINMAL an
+    if (initLTE()) {
+      bool pathOK = datapathOK();
+      if (pathOK) {
+      if (syncTime()) DEBUG_PRINTLN("Daily time sync OK");
+      else            DEBUG_PRINTLN("Daily time sync FAILED");
+
+      File yf = SD.open(yestFile, FILE_READ);
+      if (yf) {
+        yf.close();
+        if (ftpUpload(yestFile, FTP_DATA_DIR)) {
+          DEBUG_PRINT("Daily upload OK: "); DEBUG_PRINTLN(yestFile);
+        } else {
+          DEBUG_PRINT("Daily upload FAILED: "); DEBUG_PRINTLN(yestFile);
+        }
+      } else {
+        DEBUG_PRINT("No yesterday file (skip): "); DEBUG_PRINTLN(yestFile);
+      }
+    } else {
+      DEBUG_PRINTLN("Datapath NOT OK → skipping NTP/FTP in daily job");
+    }
+    shutdownLTE();
+  } else {
+  DEBUG_PRINTLN("LTE init FAILED for daily job");
+  }
+  }
+}
+
+  digitalWrite(LED_PIN, HIGH);
+  delay(10);
+  digitalWrite(LED_PIN, LOW);
+  // DEBUG_PRINTLN("Measurement done");
+  delay(1000);
+}
