@@ -1,0 +1,558 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <SD.h>
+#include <Adafruit_BME280.h>
+#include <MKRNB.h>
+#include <RTCZero.h>
+#include <NBUDP.h>
+#include "config.h"
+
+#ifdef DEBUG_SERIAL
+#  define DEBUG_PRINT(x)   Serial.print(x)
+#  define DEBUG_PRINTLN(x) Serial.println(x)
+#else
+#  define DEBUG_PRINT(x)
+#  define DEBUG_PRINTLN(x)
+#endif
+
+Adafruit_BME280 bme;
+NB nbAccess;
+GPRS gprs;
+NBUDP udp;
+RTCZero rtc;
+long timeDiffMs = 0; // difference between NTP time and RTC in ms
+
+File dataFile;
+
+bool sdMounted = false;
+bool runMainLoop = true;
+
+
+unsigned long lastMinute = 0;
+unsigned long lastHour = 0;
+unsigned long startDay = 0;
+String currentDayStamp;
+String currentFile;
+
+long lastTimeDiffMs = 0;
+long lastSyncEpoch = 0;
+long thisSyncEpoch = 0;
+
+int lastSyncHour = -1;      // Zum Tracken des letzten Syncs (für Flankenerkennung)
+int lastSyncDay  = -1;      // Tag für Tagesupload
+bool dayUploaded = false;   // Flag, um Tagesupload nur 1x pro Tag zu machen
+
+
+IPAddress ntpServer = IPAddress NTP_SERVER_IP;
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+
+// Helpers to access RTC values in a familiar way
+int year() { return rtc.getYear() + 2000; }
+int month() { return rtc.getMonth(); }
+int day() { return rtc.getDay(); }
+int hour() { return rtc.getHours(); }
+int minute() { return rtc.getMinutes(); }
+int second() { return rtc.getSeconds(); }
+
+void blinkError(int hz) {
+  int delayMs = 500 / hz;
+  for (int i = 0; i < hz*2; ++i) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(delayMs);
+  }
+  digitalWrite(LED_PIN, LOW);
+}
+
+float readNTC() {
+  int raw = analogRead(PIN_NTC);
+  float resistance = (10000.0 * raw) / (1023.0 - raw); // <-- Diese Zeile geändert!
+  float steinhart;
+  steinhart = resistance / 10000.0;
+  steinhart = log(steinhart);
+  steinhart /= NTC_BETA;
+  steinhart += 1.0 / (25.0 + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+  steinhart += NTC_OFFSET;
+  return steinhart;
+}
+
+// Gibt true zurück, wenn aktuelle Uhrzeit auf den gewünschten Stundenwert trifft
+bool isSyncHour() {
+  // Jede 4. Stunde ab 0:00 (also 0, 4, 8, 12, 16, 20)
+  return (minute() == 0 && (hour() % 4 == 0));
+}
+
+
+float readBattery() {
+  int raw = analogRead(PIN_BAT);
+  return raw * (2.0 * 3.3 / 1023.0); // 100k/100k divider
+}
+
+unsigned long sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  udp.beginPacket(address, 123);
+  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+  return millis();
+}
+
+bool checkBME() {
+  DEBUG_PRINTLN("Checking BME280...");
+  if (!bme.begin(BME_ADDRESS)) {
+    DEBUG_PRINTLN("BME280 not found");
+    return false;
+  }
+  DEBUG_PRINTLN("BME280 found");
+  float t = bme.readTemperature();
+  float p = bme.readPressure() / 100.0;
+  float h = bme.readHumidity();
+  return (t > TEMP_MIN && t < TEMP_MAX &&
+          p > PRESS_MIN && p < PRESS_MAX &&
+          h > HUM_MIN && h < HUM_MAX);
+}
+
+bool initLTE() {
+  DEBUG_PRINTLN("Initializing LTE...");
+  shutdownLTE();
+    if (nbAccess.begin(SIM_PIN) != NB_READY) {
+    DEBUG_PRINTLN("NB begin failed");
+    return false;
+  }
+  if (gprs.attachGPRS() != GPRS_READY) {
+    DEBUG_PRINTLN("GPRS attach failed");
+    return false;
+  }
+  DEBUG_PRINTLN("LTE ready");
+  return true;
+}
+
+void shutdownLTE() {
+  //delay(1000);
+  //gprs.detachGPRS(false);
+  delay(1000);
+  nbAccess.shutdown(); // Optional!
+  delay(15000);  
+}
+
+// Synchronisiert die RTC-Zeit mit einem NTP-Server über UDP.
+// Berechnet außerdem die Zeitabweichung und speichert die aktuellen/letzten Sync-Werte für spätere Vergleiche.
+bool syncTime() {
+    udp.stop(); // Stellt sicher, dass vorherige UDP-Verbindungen geschlossen sind (wichtig für NB1500).
+    DEBUG_PRINTLN("Syncing time via NTP...");
+    delay(3000);
+    rtc.begin(); // Stellt sicher, dass die RTC bereit ist.
+    delay(1000);
+    udp.begin(NTP_LOCAL_PORT); // Öffnet einen lokalen UDP-Port für die NTP-Anfrage.
+    sendNTPpacket(ntpServer);  // Schickt ein NTP-Request-Paket an den konfigurierten NTP-Server.
+
+    unsigned long start = millis(); // Startzeit für Timeout-Messung (max. 5 Sekunden warten).
+    while (millis() - start < 5000) {
+        if (udp.parsePacket()) { // Prüft, ob eine Antwort vom NTP-Server empfangen wurde.
+            udp.read(packetBuffer, NTP_PACKET_SIZE); // Liest das komplette NTP-Paket in den Puffer ein.
+
+            // Extrahiert die Zeit-Information aus dem NTP-Paket (Sekunden seit 1.1.1900)
+            unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+            unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);
+            const unsigned long seventyYears = 2208988800UL; // Sekunden von 1900 bis 1970 (Unix-Epoch)
+            unsigned long epoch = (highWord << 16 | lowWord) - seventyYears; // Berechnet Unix-Zeit (Sekunden seit 1970)
+            
+            unsigned long before = rtc.getEpoch(); // Holt aktuelle RTC-Zeit (vor dem Setzen)  
+            //lastTimeDiffMs = timeDiffMs;    // Merkt die aktuelle Zeitabweichung für spätere Vergleiche
+            timeDiffMs = ((int64_t)epoch - (int64_t)before); //* 1000L; // Differenz zwischen NTP-Zeit und RTC (in Millisekunden)
+
+            // Synchronisations-Werte für spätere Vergleiche sichern ---
+            lastSyncEpoch = thisSyncEpoch;  // Speichert das "letzte" Sync-Epoch (für Vergleich/Delta)
+             thisSyncEpoch = epoch;          // Aktualisiert das aktuelle Sync-Epoch (Unix-Zeit)
+            rtc.setEpoch(epoch);                        // <-- Hier wird die RTC gestellt!                 
+                
+            // Debug-Ausgaben zur Kontrolle
+            DEBUG_PRINT("Epoch: ");
+            DEBUG_PRINTLN(epoch);
+            DEBUG_PRINT("RTC diff ms: ");
+            DEBUG_PRINTLN(timeDiffMs);
+            DEBUG_PRINTLN("Time synced via NTP");
+
+            udp.stop(); // Schließt die UDP-Verbindung nach erfolgreicher Synchronisierung.
+            return true; // Synchronisierung war erfolgreich
+        }
+    }
+    udp.stop(); // Schließt die UDP-Verbindung nach Timeout (kein Paket empfangen).
+    DEBUG_PRINTLN("No NTP response"); // Debug-Ausgabe bei Timeout/Fehler
+    return false; // Synchronisierung fehlgeschlagen
+}
+
+bool initSD() {
+  DEBUG_PRINTLN("Initializing SD...");
+  if (!SD.begin(PIN_SD_CS)) {
+    DEBUG_PRINTLN("SD init failed");
+    return false;
+  }
+  DEBUG_PRINTLN("SD ready");
+  return true;
+}
+
+String timeStamp() {
+  char buf[7];
+  sprintf(buf, "%02d%02d%02d", year() % 100, month(), day());
+  return String(buf);
+}
+
+void appendData(File &f) {
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%.2f",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(), readBattery());
+  f.println(buf);
+  DEBUG_PRINTLN(buf);
+}
+
+void appendStatusData(File &f) {
+  char buf[120];
+  snprintf(buf, sizeof(buf), "%02d%02d%02d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f;%.2f;%ld",
+           year() % 100, month(), day(), hour(), minute(), second(),
+           readNTC(), bme.readTemperature(), bme.readPressure() / 100.0,
+           bme.readHumidity(), readBattery(), timeDiffMs);
+  f.println(buf);
+  DEBUG_PRINTLN(buf);
+}
+
+bool ftpUpload(const String &localName, const char *remoteDir) {
+  DEBUG_PRINTLN("===== FTP UPLOAD START =====");
+  shutdownLTE();
+  initLTE();
+  // Vor JEDEM neuen FTP-Versuch GPRS neu aufbauen
+  //DEBUG_PRINTLN("Detaching GPRS...");
+  //gprs.detachGPRS();
+  //delay(500);
+  //DEBUG_PRINTLN("Attaching GPRS...");
+  if (gprs.attachGPRS() != GPRS_READY) {
+    DEBUG_PRINTLN("GPRS attach failed!");
+    return false;
+  }
+
+  File f = SD.open(localName);
+  if (!f) {
+    DEBUG_PRINTLN("FTP open failed");
+    return false;
+  }
+
+  NBClient ftp;
+  unsigned long t0;
+
+  DEBUG_PRINT("Connecting to FTP server: ");
+  DEBUG_PRINT(FTP_SERVER);
+  DEBUG_PRINT(":");
+  DEBUG_PRINTLN(FTP_PORT);
+  t0 = millis();
+  if (!ftp.connect(FTP_SERVER, FTP_PORT)) {
+    DEBUG_PRINTLN("FTP connect failed");
+    f.close();
+    return false;
+  }
+  DEBUG_PRINT("Control connect time [ms]: ");
+  DEBUG_PRINTLN(millis() - t0);
+
+  String resp;
+
+  auto readResp = [&](String &out, unsigned long timeout = 6000, const char* waitFor = nullptr) {
+    out = "";
+    unsigned long start = millis();
+    while (millis() - start < timeout) {
+      while (ftp.available()) {
+        char c = ftp.read();
+        out += c;
+        start = millis();
+        if (waitFor && out.indexOf(waitFor) != -1) {
+          DEBUG_PRINTLN("--- FTP RESP EARLY EXIT (Found waitFor) ---");
+          DEBUG_PRINTLN(out);
+          return;
+        }
+      }
+    }
+    DEBUG_PRINTLN("--- FTP RESP TIMEOUT/END ---");
+    DEBUG_PRINTLN(out);
+  };
+
+  // FTP Login & Setup
+  readResp(resp);
+  ftp.print("USER " FTP_USER "\r\n");
+  readResp(resp);
+  ftp.print("PASS " FTP_PASS "\r\n");
+  readResp(resp);
+  ftp.print("TYPE I\r\n");
+  readResp(resp);
+
+  // EPSV für Datenkanal
+  ftp.print("EPSV\r\n");
+  readResp(resp);
+  int p1 = resp.indexOf('(');
+  int p2 = resp.indexOf(')', p1);
+  int dataPort = 0;
+  if (p1 >= 0 && p2 > p1) {
+    String inside = resp.substring(p1 + 1, p2); // z.B. "|||12345|"
+    int lastPipe = inside.lastIndexOf('|');
+    int firstNum = inside.lastIndexOf('|', lastPipe - 1) + 1;
+    if (lastPipe > firstNum) {
+      dataPort = inside.substring(firstNum, lastPipe).toInt();
+    }
+  }
+  DEBUG_PRINT("EPSV: extracted data port: ");
+  DEBUG_PRINTLN(dataPort);
+  if (dataPort == 0) {
+    ftp.stop();
+    f.close();
+    DEBUG_PRINTLN("EPSV parse failed");
+    return false;
+  }
+
+  // Datenkanal öffnen mit Timeout
+  NBClient data;
+  DEBUG_PRINT("Connecting data channel: ");
+  DEBUG_PRINT(FTP_SERVER);
+  DEBUG_PRINT(":");
+  DEBUG_PRINTLN(dataPort);
+  t0 = millis();
+  bool dataConnected = false;
+  unsigned long connectTimeout = 7000;
+  unsigned long connectStart = millis();
+  while (millis() - connectStart < connectTimeout) {
+    if (data.connect(FTP_SERVER, dataPort)) {
+      dataConnected = true;
+      break;
+    }
+    delay(100);
+  }
+  DEBUG_PRINT("Data connect time [ms]: ");
+  DEBUG_PRINTLN(millis() - t0);
+  if (!dataConnected) {
+    DEBUG_PRINTLN("data connect failed (timeout)");
+    ftp.stop();
+    f.close();
+    return false;
+  } else {
+    DEBUG_PRINTLN("Data channel connected.");
+  }
+
+  // STOR-Kommando und Transfer
+  ftp.print("STOR ");
+  ftp.print(remoteDir);
+  ftp.print("/");
+  ftp.print(localName);
+  ftp.print("\r\n");
+  readResp(resp);
+
+  DEBUG_PRINTLN("Transferring file...");
+  t0 = millis();
+  size_t totalBytes = 0;
+  uint8_t buf[64];
+  while (f.available()) {
+    int len = f.read(buf, sizeof(buf));
+    if (len > 0) {
+      size_t written = data.write(buf, len);
+      totalBytes += written;
+      if (written != (size_t)len) {
+        DEBUG_PRINT("Warning: Data written < data read! Written: ");
+        DEBUG_PRINT(written);
+        DEBUG_PRINT(", Read: ");
+        DEBUG_PRINTLN(len);
+      }
+    }
+  }
+  data.stop();
+  DEBUG_PRINT("Transfer time [ms]: ");
+  DEBUG_PRINTLN(millis() - t0);
+  DEBUG_PRINT("Transferred bytes: ");
+  DEBUG_PRINTLN(totalBytes);
+
+  // Keine Antwort auf "226" abwarten, auch kein QUIT!
+  ftp.stop();
+  f.close();
+
+  // GPRS nach jedem Upload wieder trennen (Stack sauber halten)
+  //DEBUG_PRINTLN("Detaching GPRS...");
+  //gprs.detachGPRS();
+  //delay(500);
+
+  shutdownLTE();
+  DEBUG_PRINTLN("FTP upload done");
+  DEBUG_PRINTLN("===== FTP UPLOAD END =====");
+  return true;
+}
+
+
+//----------------------------------------------------------SETUP------------------------------------------------------------
+
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  digitalWrite(LED_PIN, HIGH); // LED on during initialization
+  rtc.begin();
+
+#ifdef DEBUG_SERIAL
+  //Serial.begin(DEBUG_BAUD);
+  while (!Serial) {
+    ;
+  }
+  DEBUG_PRINTLN("\nStarting " SENSOR_ID " firmware " SOFTWARE_VERSION);
+#endif
+
+  delay(3000);
+  if (!initLTE()) {
+    blinkError(4);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
+  }
+  DEBUG_PRINTLN("LTE initialized");
+  if (!syncTime()) {
+    blinkError(4);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
+    DEBUG_PRINTLN("Time sync failed");
+  } else {
+    DEBUG_PRINTLN("Time synchronized");
+  }
+  if (!checkBME()) {
+    blinkError(3);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
+  }
+  DEBUG_PRINTLN("BME280 ready");
+  if (!initSD()) {
+    blinkError(3);
+    digitalWrite(LED_PIN, HIGH); // keep LED on after error blink
+  }
+  DEBUG_PRINTLN("SD card ready");
+  String statName = String(SENSOR_ID) + "_stat0.txt";
+  File stat = SD.open(statName, FILE_WRITE);
+  DEBUG_PRINTLN("Writing stat file");
+  for (int i = 0; i < 3; ++i) {
+    appendStatusData(stat);
+    stat.flush();
+    delay(1000);
+  }
+  stat.close();
+  ftpUpload(statName, FTP_STAT_DIR);
+
+  startDay = millis();
+  lastMinute = millis();
+  lastHour = millis();
+  currentDayStamp = timeStamp();
+  currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
+  DEBUG_PRINTLN("Initialization complete");
+  digitalWrite(LED_PIN, LOW); // LED off before entering measurement loop
+}
+
+
+//------------------------------------------------LOOP------------------------------------------------
+
+
+void loop() {
+  // DEBUG_PRINTLN("Loop start");
+  if (!SD.begin(PIN_SD_CS)) {
+    digitalWrite(LED_PIN, LOW);
+    DEBUG_PRINTLN("SD card not present");
+    delay(1000);
+    return;
+  }
+
+   if (digitalRead(PIN_BUTTON) == LOW) {
+    dataFile.close();
+    SD.end();
+    sdMounted = false;
+    DEBUG_PRINTLN("SD card unmounted");
+    while (digitalRead(PIN_BUTTON) == LOW) { delay(50); }
+    DEBUG_PRINTLN("Button released");
+    runMainLoop = false; //💡 Mainloop anhalten, ab jetzt nur blinken!
+    return;
+  }
+
+  if (millis() - lastMinute >= 60000) {
+    dataFile = SD.open(currentFile, FILE_WRITE);
+    appendData(dataFile);
+    dataFile.close();
+    DEBUG_PRINTLN("Data logged");
+    lastMinute += 60000;
+  }
+
+  
+
+ // Stündlicher Block: Alle 4h ab 0:00 (0,4,8,12,16,20 Uhr, Minute = 0)
+if (isSyncHour() && hour() != lastSyncHour) {
+  lastSyncHour = hour();    // Merken, damit jede Stunde nur EIN Mal ausgeführt wird
+  lastSyncDay  = day();     // Zum Vergleich für Tagesupload
+
+  DEBUG_PRINTLN("Stündlicher Block (4h): Timesync, Stat, FTP");
+
+  bool lteOk = initLTE();
+  if (!lteOk) {
+      DEBUG_PRINTLN("LTE init FAILED! Überspringe Time-Sync/FTP.");
+  } else {
+      if (syncTime()) {
+          DEBUG_PRINTLN("Hourly time sync OK");
+      } else {
+          DEBUG_PRINTLN("Hourly time sync FAILED");
+      }
+
+      // Status schreiben
+      String statName = String(SENSOR_ID) + "_stat1.txt";
+      File stat = SD.open(statName, FILE_WRITE);
+      if (stat) {
+          appendStatusData(stat);
+          stat.close();
+      } else {
+          DEBUG_PRINTLN("Stat file open failed!");
+      }
+
+      // FTP-Upload der Statusdatei
+      if (ftpUpload(statName, FTP_STAT_DIR)) {
+          DEBUG_PRINTLN("Hourly stat upload OK");
+      } else {
+          DEBUG_PRINTLN("Hourly stat upload FAILED");
+      }
+  }
+  shutdownLTE(); // Modem immer runterfahren (auch bei Fehler)
+  DEBUG_PRINTLN("Stündlicher Block abgeschlossen.");
+
+  // Tagesupload, falls 0 Uhr (direkt nach erstem Stundensync)
+  if (hour() == 0 && !dayUploaded) {
+      // Tagessync & Upload
+      initLTE();
+      ftpUpload(currentFile, FTP_DATA_DIR);
+      DEBUG_PRINTLN("Tagesupload ausgelöst (direkt nach 0:00)");
+      currentDayStamp = timeStamp();
+      currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
+      startDay = millis();
+      dayUploaded = true;
+  } else if (hour() != 0) {
+      // Reset für nächsten Tag (Sicherheitsnetz)
+      dayUploaded = false;
+  }
+}
+
+
+
+  if (millis() - startDay >= 86400000) {
+    initLTE();
+    ftpUpload(currentFile, FTP_DATA_DIR);
+    DEBUG_PRINTLN("Daily upload trigger");
+    currentDayStamp = timeStamp();
+    currentFile = String(SENSOR_ID) + currentDayStamp + ".csv";
+    startDay += 86400000;
+  }
+
+  digitalWrite(LED_PIN, HIGH);
+  delay(10);
+  digitalWrite(LED_PIN, LOW);
+  // DEBUG_PRINTLN("Measurement done");
+  delay(1000);
+}
